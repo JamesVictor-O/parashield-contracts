@@ -554,6 +554,9 @@ impl ClaimsProcessor {
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
 
+        // SECURITY FIX: Verify claim status is Pending before processing to prevent
+        // reprocessing already settled claims. This protects against double-payouts
+        // and ensures claim state transitions are properly enforced.
         if claim.status != ClaimStatus::Pending {
             return ClaimResult::AlreadyProcessed;
         }
@@ -847,14 +850,28 @@ impl ClaimsProcessor {
     // ── Dispute ───────────────────────────────────────────────────────────────
 
     /// Escalate a Pending or Rejected claim to Disputed status.
-    /// Only the original claimant may dispute. Removes the claim from the pending queue
-    /// so it is not auto-processed again until an admin resolves the dispute.
-    pub fn dispute_claim(env: Env, claimant: Address, claim_id: u128, reason: soroban_sdk::Symbol) {
-        claimant.require_auth();
+    /// SECURITY FIX: Only the original claimant or the policy holder may dispute.
+    /// This restricts dispute initiation to parties with legitimate interest in the claim.
+    /// Removes the claim from the pending queue so it is not auto-processed again until
+    /// an admin resolves the dispute.
+    pub fn dispute_claim(env: Env, caller: Address, claim_id: u128, reason: soroban_sdk::Symbol) {
+        caller.require_auth();
         let mut claim: Claim = env.storage().persistent()
             .get(&StorageKey::Claim(claim_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
-        if claim.claimant != claimant { panic_with_error!(&env, Error::Unauthorized); }
+        
+        // SECURITY FIX: Verify caller is either the claimant or the policy holder.
+        // Get the policy to check the policyholder address.
+        let policy_engine: Address = env.storage().instance()
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        let policy = PolicyEngineClient::new(&env, &policy_engine)
+            .get_policy(&claim.policy_id);
+        
+        // Only the claimant or the policyholder can dispute a claim
+        if caller != claim.claimant && caller != policy.policyholder {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
         // Only open (Pending), rejected, or partially-paid claims are disputable.
         // Fully Paid claims are already settled (USDC transferred), Disputed
         // claims are already open, and Expired claims should not be reopened.

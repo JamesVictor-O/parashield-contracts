@@ -978,8 +978,18 @@ impl OracleVerifier {
 
     /// Set the minimum number of oracle submissions required to form a consensus value.
     /// `min_count` must be at least 1; the default is 1.
+    /// 
+    /// SECURITY FIX: Enforces min_count >= 1 to prevent claims from being processed
+    /// without any oracle verification. A value of 0 would allow unverified claims.
     pub fn set_min_oracle_count(env: Env, admin: Address, min_count: u32) {
         Self::require_admin(&env, &admin);
+        
+        // SECURITY FIX: Validate min_count is at least 1 to ensure oracle verification
+        // is always required. Without this check, setting 0 would bypass oracle checks.
+        if min_count == 0 {
+            panic_with_error!(&env, Error::InvalidThreshold);
+        }
+        
         env.storage()
             .instance()
             .set(&StorageKey::MinOracleCount, &min_count);

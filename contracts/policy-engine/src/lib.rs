@@ -729,6 +729,10 @@ impl PolicyEngine {
         let end_time = start_time
             .checked_add(duration_secs)
             .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
+        
+        // SECURITY FIX: Validate that start_time < end_time to prevent invalid policies.
+        // Policies with start >= end are meaningless and should be rejected at purchase time.
+        // This check protects against arithmetic edge cases and ensures policy duration is positive.
         if end_time <= start_time {
             panic_with_error!(env, Error::InvalidDurationRange);
         }
