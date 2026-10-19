@@ -241,6 +241,25 @@ const MAX_ESCALATION_THRESHOLD: u64 = 90 * 24 * 60 * 60;
 /// after the event it relates to (issue #386).
 const DEFAULT_CLAIM_DEADLINE: u64 = 30 * 24 * 60 * 60;
 
+/// Upper bound on the admin-configurable claim submission deadline (issue
+/// #625). Without a ceiling an admin could set `claim_deadline` to `u64::MAX`,
+/// which would allow a claim to be filed indefinitely far in the future —
+/// after the triggering event can no longer be verified by oracle data and
+/// after any meaningful recourse for the claimant. 365 days is the same
+/// retention horizon used for claim entries themselves
+/// (`CLAIM_RETENTION_SECONDS`), keeping the submission window within the
+/// lifetime of the data that backs it.
+const MAX_CLAIM_DEADLINE: u64 = 365 * 24 * 60 * 60;
+
+/// Hard upper bound on how far in the future a claim may be submitted
+/// relative to the current ledger time (issue #625). The ledger timestamp
+/// is authoritative, so a caller cannot forge it — but a claim submitted
+/// against a policy whose `start_time` is more than this window in the
+/// future is rejected outright, since there is nothing to claim for yet.
+/// 1 hour is generous enough to absorb ledger-time skew without rejecting
+/// a legitimately scheduled policy whose coverage just began.
+const MAX_FUTURE_SUBMISSION_WINDOW: u64 = 60 * 60;
+
 // ─── Fraud detection (issue #437) ────────────────────────────────────────────
 
 /// Ceiling for `FraudConfig.fraud_threshold_score`. Scores above 100 could
@@ -425,6 +444,15 @@ impl ClaimsProcessor {
         // Guard: reject claims outside the active coverage period
         let now = env.ledger().timestamp();
         if now < policy.start_time || now > policy.end_time {
+            panic_with_error!(env, Error::ClaimOutsideCoveragePeriod);
+        }
+
+        // Issue #625: reject submissions that are too far in the future
+        // relative to the current ledger time. A scheduled policy whose
+        // `start_time` is far ahead has no observable trigger yet, so a claim
+        // filed against it is not grounded in anything verifiable. The small
+        // window absorbs ledger-time skew for a policy that just began.
+        if policy.start_time > now.saturating_add(MAX_FUTURE_SUBMISSION_WINDOW) {
             panic_with_error!(env, Error::ClaimOutsideCoveragePeriod);
         }
 
@@ -1616,6 +1644,11 @@ impl ClaimsProcessor {
         Self::require_admin(&env, &admin);
 
         if deadline != 0 && deadline < MIN_ESCALATION_THRESHOLD {
+            panic_with_error!(&env, Error::InvalidThresholdValue);
+        }
+        // Issue #625: cap the configurable deadline so an admin cannot open a
+        // claim submission window that extends indefinitely into the future.
+        if deadline > MAX_CLAIM_DEADLINE {
             panic_with_error!(&env, Error::InvalidThresholdValue);
         }
 
