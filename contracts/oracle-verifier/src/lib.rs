@@ -2045,11 +2045,12 @@ impl OracleVerifier {
         timestamp: u64,
     ) {
         oracle.require_auth();
+        // Validate data_type is non-empty before any storage lookup (#588).
+        Self::validate_symbol_len(&env, &data_type);
         Self::require_data_type_active(&env, &data_type);
         if Self::encryption_required(&env, &data_type) {
             panic_with_error!(&env, Error::EncryptionRequiredForType);
         }
-        Self::validate_symbol_len(&env, &data_type);
         // Bound the key before it is used to build a persistent storage entry
         // (#565).
         Self::validate_key_len(&env, &key);

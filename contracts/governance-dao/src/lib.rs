@@ -57,6 +57,10 @@ const DEPOSIT_RECLAIM_TIMEOUT: u64 = 14 * 24 * 3_600; // 14 days
 /// admin could configure `quorum_bps = 0`, letting a proposal pass on
 /// negligible turnout. 1000 = 10% of total supply must participate.
 const MIN_QUORUM_BPS: u32 = 1_000;
+/// Upper bound on `DaoConfig.quorum_bps` (issue #590). Without a ceiling the
+/// admin could set `quorum_bps = 100_001`, making quorum mathematically impossible
+/// and permanently bricking all proposals. 10_000 = 100% of total supply.
+const MAX_QUORUM_BPS: u32 = 10_000;
 /// Number of recent proposals averaged for participation when adaptive quorum
 /// is enabled without an explicit window.
 const DEFAULT_PARTICIPATION_WINDOW: u32 = 5;
@@ -207,6 +211,8 @@ pub enum Error {
     EmptyDescription = 47,
     /// Proposal title exceeds the maximum allowed length. (issue #584)
     TitleTooLong = 48,
+    /// `quorum_bps` exceeds `MAX_QUORUM_BPS` (issue #590).
+    QuorumTooHigh = 49,
 }
 
 #[contract]
@@ -257,6 +263,9 @@ impl GovernanceDao {
         }
         if config.quorum_bps < MIN_QUORUM_BPS {
             panic_with_error!(&env, Error::QuorumTooLow);
+        }
+        if config.quorum_bps > MAX_QUORUM_BPS {
+            panic_with_error!(&env, Error::QuorumTooHigh);
         }
         env.storage().instance().set(&StorageKey::Admin, &admin);
         env.storage().instance().set(&StorageKey::Config, &config);
@@ -1963,6 +1972,9 @@ impl GovernanceDao {
         }
         if config.quorum_bps < MIN_QUORUM_BPS {
             panic_with_error!(&env, Error::QuorumTooLow);
+        }
+        if config.quorum_bps > MAX_QUORUM_BPS {
+            panic_with_error!(&env, Error::QuorumTooHigh);
         }
         env.storage().instance().set(&StorageKey::Config, &config);
 
