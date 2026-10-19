@@ -417,7 +417,16 @@ impl RiskPool {
         let token_client = token::Client::new(&env, &usdc);
         let this_pool = env.current_contract_address();
         let balance_before = token_client.balance(&this_pool);
-        token_client.transfer(&provider, &this_pool, &amount);
+        // Explicitly verify the token transfer succeeded before crediting
+        // shares (issue #617). Using try_transfer and checking the result
+        // ensures a failed transfer is caught here rather than silently
+        // minting shares against funds that never arrived.
+        match token_client.try_transfer(&provider, &this_pool, &amount) {
+            Ok(Ok(())) => {}
+            _ => {
+                panic_with_error!(&env, Error::InvalidToken);
+            }
+        }
         // The pool only ever takes the token it was configured with. Confirm
         // that token actually delivered the full amount, so a token that
         // under-delivers cannot mint shares against funds that never arrived

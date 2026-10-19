@@ -37,6 +37,11 @@ const CURRENT_STORAGE_VERSION: u32 = 3;
 const MAX_BATCH_BUY: u32 = 20;
 const DEFAULT_EXPIRY_WARNING_WINDOW: u64 = 7 * 24 * 60 * 60;
 const MAX_EXPIRY_SCAN: u32 = 50;
+/// Upper bound on a product's `coverage_max`. A product with an absurdly high
+/// ceiling would let a single policy lock up unbounded pool capital and create
+/// unrealistic exposure (issue #616). Matches the per-policy cap enforced in
+/// `buy_policy_inner`.
+const MAX_COVERAGE_LIMIT: i128 = 1_000_000_000_000;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -298,8 +303,10 @@ impl PolicyEngine {
         if params.premium_rate_bps > 10_000 {
             panic_with_error!(&env, Error::InvalidPremiumRate);
         }
-        // trigger_threshold must be positive and within the 7-decimal fixed-point
-        // range used across the protocol (1 unit = 0.0000001; max ≈ 1 quadrillion).
+        // trigger_threshold must be strictly positive (issue #619) and within
+        // the 7-decimal fixed-point range used across the protocol
+        // (1 unit = 0.0000001; max ≈ 1 quadrillion). Zero or negative
+        // thresholds would make every policy unconditionally payable.
         if params.trigger_threshold <= 0
             || params.trigger_threshold > 1_000_000_000_000_000_000_000i128
         {
@@ -312,6 +319,13 @@ impl PolicyEngine {
         // needs no separate branch.
         if params.coverage_min <= 0 || params.coverage_min >= params.coverage_max {
             panic_with_error!(&env, Error::InvalidCoverageRange);
+        }
+        // Coverage ceiling must be reasonable (issue #616). An unbounded
+        // coverage_max would let a single policy lock unbounded pool capital
+        // and create unrealistic exposure. Capped at MAX_COVERAGE_LIMIT to
+        // match the per-policy limit in buy_policy_inner.
+        if params.coverage_max > MAX_COVERAGE_LIMIT {
+            panic_with_error!(&env, Error::CoverageOutOfRange);
         }
         // max_duration_days must be positive and less than 3650 (up to 10 years)
         // Rejects 0-day policies and unrealistically long durations
