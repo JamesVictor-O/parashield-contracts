@@ -441,7 +441,6 @@ impl ClaimsProcessor {
         // for a bounded window after the policy ends (`claim_deadline`); once
         // that window closes the triggering event is too old to act on and the
         // submission is rejected (issue #386).
-        // Guard: reject claims outside the active coverage period
         let now = env.ledger().timestamp();
         if now < policy.start_time {
             panic_with_error!(env, Error::ClaimOutsideCoveragePeriod);
@@ -466,6 +465,19 @@ impl ClaimsProcessor {
         // filed against it is not grounded in anything verifiable. The small
         // window absorbs ledger-time skew for a policy that just began.
         if policy.start_time > now.saturating_add(MAX_FUTURE_SUBMISSION_WINDOW) {
+            panic_with_error!(env, Error::ClaimOutsideCoveragePeriod);
+        }
+
+        // Issue #635: allow claims filed after end_time within claim_deadline,
+        // then reject anything past that window. The prior code rejected
+        // `now > end_time` before this check ran, making the deadline window
+        // unreachable.
+        if policy.end_time > 0 {
+            let cutoff = policy.end_time.saturating_add(Self::claim_deadline(env));
+            if now > cutoff {
+                panic_with_error!(env, Error::ClaimDeadlinePassed);
+            }
+        } else if now > policy.end_time {
             panic_with_error!(env, Error::ClaimOutsideCoveragePeriod);
         }
 
