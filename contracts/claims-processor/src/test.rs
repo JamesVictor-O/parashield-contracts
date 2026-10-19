@@ -2001,11 +2001,60 @@ fn test_per_category_escalation_threshold() {
     let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
     let crop = symbol_short!("crop");
     let threshold = 3600; // 1 hour
-    
+
     // Default is none
     assert_eq!(cp.get_category_escalation_threshold(&crop), None);
-    
+
     // Set category threshold
     cp.set_category_escalation_threshold(&w.admin, &crop, &threshold);
     assert_eq!(cp.get_category_escalation_threshold(&crop), Some(threshold));
+}
+
+// ── Guardian threshold validation (#608) ─────────────────────────────────────
+
+#[test]
+fn set_guardians_with_positive_threshold_succeeds() {
+    let w = deploy();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let g1 = Address::generate(&w.env);
+    let g2 = Address::generate(&w.env);
+    let guardians = Vec::from_array(&w.env, [g1.clone(), g2.clone()]);
+
+    cp.set_guardians(&w.admin, &guardians, &1u32);
+    assert_eq!(cp.get_guardian_threshold(), 1u32);
+}
+
+#[test]
+fn clear_guardians_with_zero_threshold_succeeds() {
+    // Clearing guardians (empty vec, threshold=0) must still be allowed.
+    let w = deploy();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let guardians: Vec<Address> = Vec::new(&w.env);
+
+    cp.set_guardians(&w.admin, &guardians, &0u32);
+    assert_eq!(cp.get_guardian_threshold(), 0u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn set_guardians_rejects_zero_threshold_with_nonempty_set() {
+    // Setting guardians with threshold=0 would silently disable multisig
+    // while leaving the guardian set populated, which is a security hole.
+    let w = deploy();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let g = Address::generate(&w.env);
+    let guardians = Vec::from_array(&w.env, [g]);
+
+    cp.set_guardians(&w.admin, &guardians, &0u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn set_guardians_rejects_threshold_exceeding_guardian_count() {
+    let w = deploy();
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let g = Address::generate(&w.env);
+    let guardians = Vec::from_array(&w.env, [g]);
+
+    cp.set_guardians(&w.admin, &guardians, &2u32);
 }

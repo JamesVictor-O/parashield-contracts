@@ -1210,6 +1210,12 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         if admin != stored_admin { panic_with_error!(&env, Error::Unauthorized); }
         admin.require_auth();
+        // A non-empty guardian set with threshold=0 would bypass multisig
+        // entirely while appearing configured (#608). Require at least one
+        // approval whenever guardians are active.
+        if !guardians.is_empty() && threshold == 0 {
+            panic_with_error!(&env, Error::InvalidThreshold);
+        }
         if threshold > guardians.len() {
             panic_with_error!(&env, Error::InvalidThreshold);
         }
