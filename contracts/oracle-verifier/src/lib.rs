@@ -267,6 +267,10 @@ impl OracleVerifier {
         }
         // Validate data_type Symbol length (#502)
         Self::validate_symbol_len(&env, &data_type);
+        
+        // SECURITY FIX: Check if oracle is already registered for this data type.
+        // This prevents duplicate registrations which could cause issues with
+        // oracle list management and aggregation calculations.
         let key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         if env.storage().persistent().has(&key) {
             panic_with_error!(&env, Error::OracleAlreadyExists);
