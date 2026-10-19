@@ -229,6 +229,11 @@ const DEFAULT_ESCALATION_THRESHOLD: u64 = 7 * 24 * 60 * 60;
 /// signal into noise and defeats the purpose of having one.
 const MIN_ESCALATION_THRESHOLD: u64 = 60 * 60;
 
+/// Longest escalation threshold an admin may configure (90 days). An
+/// unreasonably long threshold would leave claims stuck Pending indefinitely
+/// with no recourse for the claimant (issue #618).
+const MAX_ESCALATION_THRESHOLD: u64 = 90 * 24 * 60 * 60;
+
 /// Default window after a policy's `end_time` during which a claim may still be
 /// submitted. 30 days is long enough to cover keeper latency, oracle data
 /// still arriving, or a claimant simply not noticing the trigger immediately,
@@ -1485,10 +1490,13 @@ impl ClaimsProcessor {
     /// would make every claim escalatable the moment it is submitted, which
     /// turns the signal into noise and leaves genuinely stuck claims no easier
     /// to find than they are today.
+    ///
+    /// Capped at `MAX_ESCALATION_THRESHOLD` (90 days) so claims cannot be
+    /// left Pending indefinitely with no recourse (issue #618).
     pub fn set_escalation_threshold(env: Env, admin: Address, threshold: u64) {
         Self::require_admin(&env, &admin);
 
-        if threshold < MIN_ESCALATION_THRESHOLD {
+        if threshold < MIN_ESCALATION_THRESHOLD || threshold > MAX_ESCALATION_THRESHOLD {
             panic_with_error!(&env, Error::InvalidThresholdValue);
         }
 
@@ -1502,10 +1510,12 @@ impl ClaimsProcessor {
         );
     }
 
+    /// Set a per-category escalation threshold. Same bounds as
+    /// `set_escalation_threshold` (issue #618).
     pub fn set_category_escalation_threshold(env: Env, admin: Address, category: Symbol, threshold: u64) {
         Self::require_admin(&env, &admin);
 
-        if threshold < MIN_ESCALATION_THRESHOLD {
+        if threshold < MIN_ESCALATION_THRESHOLD || threshold > MAX_ESCALATION_THRESHOLD {
             panic_with_error!(&env, Error::InvalidThresholdValue);
         }
 
