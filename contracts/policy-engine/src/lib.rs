@@ -117,6 +117,8 @@ pub enum Error {
     /// A product with this name already exists (issue #514).
     DuplicateProductName = 34,
     InvalidTriggerCombination = 35,
+    /// Product name must not be empty (issue #639).
+    EmptyProductName = 36,
 }
 
 // SECURITY: 48-hour timelock on critical admin actions (create_product, update_product).
@@ -239,6 +241,22 @@ impl PolicyEngine {
     /// `params.premium_rate_bps` must be 1-10000; `params.coverage_amount` must be positive.
     pub fn create_product(env: Env, admin: Address, params: CreateProductParams) -> u128 {
         Self::require_admin(&env, &admin);
+
+        // Product name must not be empty (issue #639).
+        {
+            let name_val = params.name.to_symbol_val();
+            let name_str: Result<SymbolStr, _> = SymbolStr::try_from_val(&env, &name_val);
+            let empty = match name_str {
+                Ok(s) => {
+                    let s_str: &str = s.as_ref();
+                    s_str.is_empty()
+                }
+                Err(_) => true,
+            };
+            if empty {
+                panic_with_error!(&env, Error::EmptyProductName);
+            }
+        }
 
         match params.trigger_type {
             TriggerType::Binary => {
