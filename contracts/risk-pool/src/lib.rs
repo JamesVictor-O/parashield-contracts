@@ -592,7 +592,7 @@ impl RiskPool {
         };
 
         let available_liquidity = total_deposited.saturating_sub(total_locked);
-        if available_liquidity <= 0 { panic_with_error!(&env, Error::Undercollateralized); }
+        if available_liquidity <= 0 { panic_with_error!(&env, Error::PoolDrained); }
         // Issue #621: shares * total_deposited / total_shares truncates
         // toward zero; if the pool has absorbed losses total_deposited
         // may be tiny relative to total_shares and a small redemption
