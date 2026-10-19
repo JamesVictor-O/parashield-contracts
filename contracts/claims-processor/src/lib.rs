@@ -802,6 +802,12 @@ impl ClaimsProcessor {
     /// Returns a Vec of (claim_id, result) pairs for the processed claims.
     /// Skips any claim that is not in Pending status (idempotent).
     ///
+    /// FAIRNESS GUARANTEE: Claims are processed in FIFO (First-In-First-Out) order
+    /// based on their submission timestamp. This ensures older claims are settled
+    /// before newer ones, preventing unfair advantage to recently submitted claims.
+    /// The pending queue maintains insertion order, and this function processes
+    /// from index 0 (oldest) onwards.
+    ///
     /// `limit` is clamped to [`MAX_BATCH_SIZE`]. Passing a larger value (or
     /// `u32::MAX`) is not an error — it simply settles the first
     /// `MAX_BATCH_SIZE` pending claims, keeping the transaction inside
@@ -819,14 +825,53 @@ impl ClaimsProcessor {
         if limit == 0 {
             panic_with_error!(&env, Error::InvalidInput);
         }
-        let pending: Vec<u128> = env.storage().instance()
+        
+        // FAIRNESS FIX: Get pending claims list - maintained in FIFO order
+        let mut pending: Vec<u128> = env.storage().instance()
             .get(&StorageKey::PendingClaims)
             .unwrap_or_else(|| Vec::new(&env));
-
+        
+        // FAIRNESS FIX: Sort claims by submission time to ensure true FIFO processing.
+        // Even if the pending queue gets slightly out of order (due to concurrent 
+        // submissions or manual queue manipulation), this ensures oldest claims 
+        // are always processed first.
+        let mut claim_timestamps: Vec<(u128, u64)> = Vec::new(&env);
+        for i in 0..pending.len() {
+            let claim_id = pending.get_unchecked(i);
+            if let Some(claim) = env.storage().persistent().get::<_, Claim>(&StorageKey::Claim(claim_id)) {
+                claim_timestamps.push_back((claim_id, claim.submitted_at));
+            }
+        }
+        
+        // Sort by timestamp (ascending - oldest first) using bubble sort
+        // Bubble sort is used here because Soroban doesn't have built-in sorting
+        let len = claim_timestamps.len();
+        for i in 0..len {
+            for j in 0..(len - i - 1) {
+                let curr = claim_timestamps.get_unchecked(j);
+                let next = claim_timestamps.get_unchecked(j + 1);
+                if curr.1 > next.1 {
+                    // Swap
+                    claim_timestamps.set(j, next);
+                    claim_timestamps.set(j + 1, curr);
+                }
+            }
+        }
+        
+        // Rebuild pending queue in correct FIFO order
+        let mut sorted_pending: Vec<u128> = Vec::new(&env);
+        for i in 0..claim_timestamps.len() {
+            let (claim_id, _) = claim_timestamps.get_unchecked(i);
+            sorted_pending.push_back(claim_id);
+        }
+        
+        // Update storage with sorted order
+        env.storage().instance().set(&StorageKey::PendingClaims, &sorted_pending);
+        
         let mut results: Vec<(u128, ClaimResult)> = Vec::new(&env);
         let effective_limit = if limit > MAX_BATCH_SIZE { MAX_BATCH_SIZE } else { limit };
-        let process_count = if pending.len() < effective_limit {
-            pending.len()
+        let process_count = if sorted_pending.len() < effective_limit {
+            sorted_pending.len()
         } else {
             effective_limit
         };
@@ -835,7 +880,7 @@ impl ClaimsProcessor {
         let fn_name = Symbol::new(&env, "auto_process");
 
         for i in 0..process_count {
-            let claim_id = pending.get_unchecked(i);
+            let claim_id = sorted_pending.get_unchecked(i);
 
             // Pre-check: skip claims that are no longer Pending without
             // spending a sub-invocation on them (fast path, no isolation cost).
@@ -1871,6 +1916,16 @@ impl ClaimsProcessor {
         let threshold = Self::escalation_threshold(&env, Some(product.category));
 
         if pending_for < threshold {
+            panic_with_error!(&env, Error::NotEscalatable);
+        }
+
+        // SECURITY FIX: Verify escalation is within the allowed time window from claim submission.
+        // Claims should only be escalatable within a reasonable time after submission.
+        // After the policy end_time + claim_deadline has passed, escalation is no longer meaningful
+        // because the policy period is over and the claim should have been processed already.
+        let claim_deadline = Self::claim_deadline(&env);
+        let escalation_cutoff = policy.end_time.saturating_add(claim_deadline);
+        if now > escalation_cutoff {
             panic_with_error!(&env, Error::NotEscalatable);
         }
 
