@@ -297,6 +297,31 @@ impl PolicyEngine {
             }
         }
 
+        // SECURITY FIX: Validate oracle_data_type matches the product's trigger type.
+        // Mismatched data types would cause claim evaluation to fail or produce incorrect results.
+        // Binary triggers expect event-based data types (flight, disaster), while
+        // Threshold/Parametric triggers expect measurement data types (weather, onchain).
+        match params.trigger_type {
+            TriggerType::Binary => {
+                // Binary triggers work with discrete event data
+                if params.oracle_data_type != symbol_short!("flight")
+                    && params.oracle_data_type != symbol_short!("disaster")
+                    && params.oracle_data_type != symbol_short!("health")
+                {
+                    panic_with_error!(&env, Error::InvalidTriggerCombination);
+                }
+            }
+            TriggerType::Threshold | TriggerType::Parametric => {
+                // Threshold/Parametric triggers work with continuous measurement data
+                if params.oracle_data_type != symbol_short!("weather")
+                    && params.oracle_data_type != symbol_short!("onchain")
+                    && params.oracle_data_type != symbol_short!("defi")
+                {
+                    panic_with_error!(&env, Error::InvalidTriggerCombination);
+                }
+            }
+        }
+
         if params.premium_rate_bps == 0 {
             panic_with_error!(&env, Error::ZeroPremiumRate);
         }
