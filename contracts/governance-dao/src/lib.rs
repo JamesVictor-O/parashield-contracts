@@ -147,6 +147,11 @@ enum StorageKey {
     /// `DaoConfig.proposal_threshold` at proposal creation time. Absent =
     /// no escalation (behaves as 1x for every proposal kind). Issue #438.
     ImpactMultipliers,
+    /// Maps a proposal content hash (SHA-256 of target+function+args) to a
+    /// proposal_id. Exists only while the proposal is open (Active or
+    /// Discussion). Cleared when the proposal resolves so the same action can
+    /// be re-proposed after the previous one closes. Issue #630.
+    ActiveProposalHash(BytesN<32>),
 }
 
 
@@ -213,6 +218,10 @@ pub enum Error {
     TitleTooLong = 48,
     /// `quorum_bps` exceeds `MAX_QUORUM_BPS` (issue #590).
     QuorumTooHigh = 49,
+    /// A proposal with the same target, function, and arguments already exists
+    /// and is still open (Active or Discussion). Duplicate proposals waste
+    /// governance resources and split voter attention (issue #630).
+    DuplicateProposal = 50,
 }
 
 #[contract]
@@ -318,7 +327,32 @@ impl GovernanceDao {
         if impact_analysis.len() > 4096 {
             panic_with_error!(&env, Error::InvalidInput);
         }
-        
+
+        // Issue #630: reject proposals that duplicate an open one.
+        // Two proposals are duplicates when they target the same contract,
+        // call the same function, and pass identical arguments — the title
+        // and impact analysis are cosmetic and irrelevant to the on-chain
+        // effect. A different title does not make a different governance
+        // action; it just splits voter attention and wastes deposit capital.
+        let content_hash = Self::proposal_content_hash(&env, &target, &function, &args);
+        let hash_key = StorageKey::ActiveProposalHash(content_hash.clone());
+        if let Some(existing_id) = env.storage().instance().get::<_, u64>(&hash_key) {
+            // Only block if the existing proposal is still open. Once it
+            // resolves the hash is cleared (see finalize/cancel/reclaim_deposit)
+            // and the same action can be re-proposed legitimately.
+            if let Some(existing) = env
+                .storage()
+                .persistent()
+                .get::<_, Proposal>(&StorageKey::Proposal(existing_id))
+            {
+                if existing.status == ProposalStatus::Active
+                    || existing.status == ProposalStatus::Discussion
+                {
+                    panic_with_error!(&env, Error::DuplicateProposal);
+                }
+            }
+        }
+
         let config: DaoConfig = env
             .storage()
             .instance()
@@ -382,6 +416,12 @@ impl GovernanceDao {
             .instance()
             .set(&StorageKey::NextProposalId, &(proposal_id.checked_add(1).unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))));
 
+        // Issue #630: register the content hash so a concurrent or subsequent
+        // identical proposal is detected and rejected while this one is open.
+        env.storage()
+            .instance()
+            .set(&hash_key, &proposal_id);
+
         // Issue #519: pull the deposit only after every check and state write
         // above has succeeded, so a failure in proposal creation can never
         // leave the proposer's tokens locked without a matching proposal.
@@ -438,7 +478,30 @@ impl GovernanceDao {
         if impact_analysis.len() > 4096 {
             panic_with_error!(&env, Error::InvalidInput);
         }
-        
+
+        // Issue #630: build the upgrade args early so we can compute the
+        // content hash before touching any config or state.
+        let upgrade_function = Symbol::new(&env, "upgrade");
+        let mut upgrade_args: Vec<Val> = Vec::new(&env);
+        upgrade_args.push_back(env.current_contract_address().into_val(&env));
+        upgrade_args.push_back(new_wasm_hash.clone().into_val(&env));
+
+        let upgrade_content_hash = Self::proposal_content_hash(&env, &target, &upgrade_function, &upgrade_args);
+        let upgrade_hash_key = StorageKey::ActiveProposalHash(upgrade_content_hash.clone());
+        if let Some(existing_id) = env.storage().instance().get::<_, u64>(&upgrade_hash_key) {
+            if let Some(existing) = env
+                .storage()
+                .persistent()
+                .get::<_, Proposal>(&StorageKey::Proposal(existing_id))
+            {
+                if existing.status == ProposalStatus::Active
+                    || existing.status == ProposalStatus::Discussion
+                {
+                    panic_with_error!(&env, Error::DuplicateProposal);
+                }
+            }
+        }
+
         let config: DaoConfig = env
             .storage()
             .instance()
@@ -462,10 +525,9 @@ impl GovernanceDao {
             .unwrap_or(0);
         let now = env.ledger().timestamp();
 
-        let mut args: Vec<Val> = Vec::new(&env);
-        args.push_back(env.current_contract_address().into_val(&env));
-        args.push_back(new_wasm_hash.into_val(&env));
-        let function = Symbol::new(&env, "upgrade");
+        // Re-use the args and function built earlier for the duplicate check.
+        let args = upgrade_args;
+        let function = upgrade_function;
 
         let discussion_period = config.discussion_period;
         let (status, vote_end) = if discussion_period > 0 {
@@ -506,6 +568,11 @@ impl GovernanceDao {
                 .checked_add(1)
                 .unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))),
         );
+
+        // Issue #630: register the content hash for this upgrade proposal.
+        env.storage()
+            .instance()
+            .set(&upgrade_hash_key, &proposal_id);
 
         // Issue #519: pull the deposit only after every check and state write
         // above has succeeded, so a failure in proposal creation can never
@@ -1126,6 +1193,10 @@ impl GovernanceDao {
         let proposal_key = StorageKey::Proposal(proposal_id);
         env.storage().persistent().set(&proposal_key, &proposal);
 
+        // Issue #630: proposal is now resolved — clear its content hash so
+        // the same action can be re-proposed.
+        Self::clear_proposal_hash(&env, &proposal);
+
         env.events().publish(
             (Symbol::new(&env, "proposal_finalized"),),
             ProposalFinalized {
@@ -1228,6 +1299,9 @@ impl GovernanceDao {
                 .persistent()
                 .set(&StorageKey::Proposal(pid), &proposal);
 
+            // Issue #630: clear hash so the same action can be re-proposed.
+            Self::clear_proposal_hash(&env, &proposal);
+
             env.events().publish(
                 (Symbol::new(&env, "proposal_finalized"),),
                 ProposalFinalized {
@@ -1281,6 +1355,9 @@ impl GovernanceDao {
 
         let proposal_key = StorageKey::Proposal(proposal_id);
         env.storage().persistent().set(&proposal_key, &proposal);
+
+        // Issue #630: clear hash so the same action can be re-proposed.
+        Self::clear_proposal_hash(&env, &proposal);
 
         env.events().publish(
             (Symbol::new(&env, "deposit_reclaimed"),),
@@ -1518,6 +1595,9 @@ impl GovernanceDao {
             &proposal.proposer,
             &proposal.deposit,
         );
+
+        // Issue #630: clear hash so the same action can be re-proposed.
+        Self::clear_proposal_hash(&env, &proposal);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_cancelled"),),
@@ -2563,8 +2643,51 @@ impl GovernanceDao {
         total
     }
 
-    fn require_admin(env: &Env, caller: &Address) {
-        let admin: Address = env
+    /// Compute a content hash over `(target, function, args)` that uniquely
+    /// identifies the on-chain action a proposal would perform. Used to detect
+    /// duplicate proposals (issue #630). SHA-256 is available through the
+    /// Soroban host and produces a 32-byte `BytesN<32>`.
+    fn proposal_content_hash(
+        env: &Env,
+        target: &Address,
+        function: &Symbol,
+        args: &Vec<Val>,
+    ) -> BytesN<32> {
+        let mut preimage = soroban_sdk::Bytes::new(env);
+        // Append the target address bytes.
+        let target_str = target.to_string();
+        let mut target_buf = [0u8; 56];
+        target_str.copy_into_slice(&mut target_buf);
+        preimage.extend_from_array(&target_buf);
+        // Append the function symbol bytes (up to 9 chars encoded as Soroban's u64).
+        let fn_val: u64 = function.to_val().get_payload();
+        preimage.extend_from_array(&fn_val.to_be_bytes());
+        // Append each arg's raw XDR payload so identical argument lists hash identically.
+        for i in 0..args.len() {
+            let v: Val = args.get_unchecked(i);
+            let payload: u64 = v.get_payload();
+            preimage.extend_from_array(&payload.to_be_bytes());
+        }
+        env.crypto().sha256(&preimage).into()
+    }
+
+    /// Remove the active-proposal hash entry for `proposal`, if present.
+    /// Called whenever a proposal leaves Active/Discussion so the same action
+    /// can be re-proposed later (issue #630).
+    fn clear_proposal_hash(env: &Env, proposal: &Proposal) {
+        let hash = Self::proposal_content_hash(
+            env,
+            &proposal.target,
+            &proposal.function,
+            &proposal.args,
+        );
+        let key = StorageKey::ActiveProposalHash(hash);
+        if env.storage().instance().has(&key) {
+            env.storage().instance().remove(&key);
+        }
+    }
+
+    fn require_admin(env: &Env, caller: &Address) {        let admin: Address = env
             .storage()
             .instance()
             .get(&StorageKey::Admin)
