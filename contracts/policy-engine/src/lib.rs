@@ -264,7 +264,7 @@ impl PolicyEngine {
     // ── Product Management (admin only) ──────────────────────────────────────
 
     /// Admin-only: create a new insurance product and return its ID.
-    /// `params.premium_rate_bps` must be 1-10000; `params.coverage_amount` must be positive.
+    /// `params.premium_rate_bps` must be 1-5000 (i.e. 0.01% to 50%); `params.coverage_amount` must be positive.
     ///
     /// Coverage must describe a real, buyable range: `0 < coverage_min <
     /// coverage_max` (issue #567). An inverted or zero-width range would
@@ -325,7 +325,13 @@ impl PolicyEngine {
         if params.premium_rate_bps == 0 {
             panic_with_error!(&env, Error::ZeroPremiumRate);
         }
-        if params.premium_rate_bps > 10_000 {
+        // Issue #626: a premium rate above 50% (5_000 bps) is unrealistic for
+        // insurance. The previous ceiling of 10_000 bps (100%) would let an
+        // admin configure a product whose premium exceeds the coverage amount
+        // for any policy longer than ~365 days, which is not a real insurance
+        // product. 5_000 bps is already well above any legitimate parametric
+        // or indemnity rate and leaves headroom for high-risk categories.
+        if params.premium_rate_bps > 5_000 {
             panic_with_error!(&env, Error::InvalidPremiumRate);
         }
         // trigger_threshold must be strictly positive (issue #619) and within
