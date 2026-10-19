@@ -623,8 +623,16 @@ impl RiskPool {
         // All withdrawal state is persisted before either external transfer
         // runs: the principal amount, then any yield owed (checks-effects-interactions).
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
-        token::Client::new(&env, &usdc)
-            .transfer(&env.current_contract_address(), &provider, &amount);
+        
+        // SECURITY FIX: Check the contract's actual USDC balance before attempting transfer
+        // to ensure the withdrawal won't fail due to insufficient token balance.
+        let usdc_client = token::Client::new(&env, &usdc);
+        let contract_balance = usdc_client.balance(&env.current_contract_address());
+        if contract_balance < amount {
+            panic_with_error!(&env, Error::InsufficientFunds);
+        }
+        
+        usdc_client.transfer(&env.current_contract_address(), &provider, &amount);
         Self::pay_out_yield(&env, &provider, pending_yield);
 
         amount

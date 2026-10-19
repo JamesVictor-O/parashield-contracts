@@ -1640,13 +1640,18 @@ impl ClaimsProcessor {
     /// status and the payout is held for `delay_seconds` before becoming
     /// claimable. This gives the protocol a window to catch fraud or errors
     /// before funds leave the pool. `0` restores immediate payout behavior.
-    pub fn set_payout_delay(env: Env, admin: Address, delay_seconds: u64) {
+    pub fn set_payout_delay(env: Env, admin: Address, delay_seconds: i64) {
         Self::require_admin(&env, &admin);
-        const MAX_PAYOUT_DELAY: u64 = 365 * 24 * 60 * 60; // 365 days
+        // Reject negative delays (issue: ClaimsProcessor allows negative payout delay)
+        if delay_seconds < 0 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        const MAX_PAYOUT_DELAY: i64 = 365 * 24 * 60 * 60; // 365 days
         if delay_seconds > MAX_PAYOUT_DELAY {
             panic_with_error!(&env, Error::PayoutDelayTooLong);
         }
-        env.storage().instance().set(&StorageKey::PayoutDelay, &delay_seconds);
+        let delay_u64 = delay_seconds as u64;
+        env.storage().instance().set(&StorageKey::PayoutDelay, &delay_u64);
         env.events().publish(
             (Symbol::new(&env, "payout_delay_set"),),
             PayoutDelayUpdated { delay_seconds },
