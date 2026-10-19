@@ -21,8 +21,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, BytesN,
-    Env, Symbol, SymbolStr, TryFromVal, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token, Address,
+    BytesN, Env, IntoVal, Symbol, SymbolStr, TryFromVal, Vec,
 };
 
 pub mod types;
@@ -37,6 +37,11 @@ const CURRENT_STORAGE_VERSION: u32 = 3;
 const MAX_BATCH_BUY: u32 = 20;
 const DEFAULT_EXPIRY_WARNING_WINDOW: u64 = 7 * 24 * 60 * 60;
 const MAX_EXPIRY_SCAN: u32 = 50;
+/// Upper bound on a product's `coverage_max`. A product with an absurdly high
+/// ceiling would let a single policy lock up unbounded pool capital and create
+/// unrealistic exposure (issue #616). Matches the per-policy cap enforced in
+/// `buy_policy_inner`.
+const MAX_COVERAGE_LIMIT: i128 = 1_000_000_000_000;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -117,8 +122,12 @@ pub enum Error {
     /// A product with this name already exists (issue #514).
     DuplicateProductName = 34,
     InvalidTriggerCombination = 35,
-    /// Product name must not be empty (issue #639).
-    EmptyProductName = 36,
+    /// The product category is not one of the supported categories (issue #549).
+    InvalidCategory = 36,
+    /// A scheduled policy start time is earlier than the current ledger time (issue #522).
+    InvalidStartTime = 37,
+    /// Premium rate cannot be zero. (issue #564)
+    ZeroPremiumRate = 38,
 }
 
 // SECURITY: 48-hour timelock on critical admin actions (create_product, update_product).
@@ -184,6 +193,23 @@ impl PolicyEngine {
             panic_with_error!(&env, Error::InvalidToken);
         }
 
+        // Verify the token implements transfer — required for premium collection,
+        // claim payouts, and refunds. A contract with balance but no transfer
+        // would fail silently on buy_policy or pay_claim.
+        let transfer_res = env.try_invoke_contract::<soroban_sdk::Bytes, soroban_sdk::Error>(
+            &usdc_token,
+            &Symbol::new(&env, "transfer"),
+            soroban_sdk::vec![
+                &env,
+                env.current_contract_address().into_val(&env),
+                env.current_contract_address().into_val(&env),
+                0i128.into_val(&env),
+            ],
+        );
+        if transfer_res.is_err() {
+            panic_with_error!(&env, Error::InvalidToken);
+        }
+
         admin.require_auth();
         env.storage()
             .instance()
@@ -238,24 +264,24 @@ impl PolicyEngine {
     // ── Product Management (admin only) ──────────────────────────────────────
 
     /// Admin-only: create a new insurance product and return its ID.
-    /// `params.premium_rate_bps` must be 1-10000; `params.coverage_amount` must be positive.
+    /// `params.premium_rate_bps` must be 1-5000 (i.e. 0.01% to 50%); `params.coverage_amount` must be positive.
+    ///
+    /// Coverage must describe a real, buyable range: `0 < coverage_min <
+    /// coverage_max` (issue #567). An inverted or zero-width range would
+    /// publish a product that `buy_policy` can never accept a policy for,
+    /// and a non-positive min would sell free cover.
     pub fn create_product(env: Env, admin: Address, params: CreateProductParams) -> u128 {
         Self::require_admin(&env, &admin);
 
-        // Product name must not be empty (issue #639).
+        // Only the supported product categories are accepted (issue #549).
+        let category = &params.category;
+        if *category != symbol_short!("crop")
+            && *category != symbol_short!("flight")
+            && *category != symbol_short!("disaster")
+            && *category != symbol_short!("health")
+            && *category != symbol_short!("defi")
         {
-            let name_val = params.name.to_symbol_val();
-            let name_str: Result<SymbolStr, _> = SymbolStr::try_from_val(&env, &name_val);
-            let empty = match name_str {
-                Ok(s) => {
-                    let s_str: &str = s.as_ref();
-                    s_str.is_empty()
-                }
-                Err(_) => true,
-            };
-            if empty {
-                panic_with_error!(&env, Error::EmptyProductName);
-            }
+            panic_with_error!(&env, Error::InvalidCategory);
         }
 
         match params.trigger_type {
@@ -271,29 +297,76 @@ impl PolicyEngine {
             }
         }
 
-        if params.premium_rate_bps == 0 || params.premium_rate_bps > 10_000 {
+        // SECURITY FIX: Validate oracle_data_type matches the product's trigger type.
+        // Mismatched data types would cause claim evaluation to fail or produce incorrect results.
+        // Binary triggers expect event-based data types (flight, disaster), while
+        // Threshold/Parametric triggers expect measurement data types (weather, onchain).
+        match params.trigger_type {
+            TriggerType::Binary => {
+                // Binary triggers work with discrete event data
+                if params.oracle_data_type != symbol_short!("flight")
+                    && params.oracle_data_type != symbol_short!("disaster")
+                    && params.oracle_data_type != symbol_short!("health")
+                {
+                    panic_with_error!(&env, Error::InvalidTriggerCombination);
+                }
+            }
+            TriggerType::Threshold | TriggerType::Parametric => {
+                // Threshold/Parametric triggers work with continuous measurement data
+                if params.oracle_data_type != symbol_short!("weather")
+                    && params.oracle_data_type != symbol_short!("onchain")
+                    && params.oracle_data_type != symbol_short!("defi")
+                {
+                    panic_with_error!(&env, Error::InvalidTriggerCombination);
+                }
+            }
+        }
+
+        // SECURITY FIX: Validate premium_rate_bps is positive and within acceptable bounds.
+        // Zero or negative (though u32 prevents negative) premium rates are invalid.
+        // A zero rate would provide free insurance, which is not economically viable.
+        if params.premium_rate_bps == 0 {
+            panic_with_error!(&env, Error::ZeroPremiumRate);
+        }
+        // Issue #626: a premium rate above 50% (5_000 bps) is unrealistic for
+        // insurance. The previous ceiling of 10_000 bps (100%) would let an
+        // admin configure a product whose premium exceeds the coverage amount
+        // for any policy longer than ~365 days, which is not a real insurance
+        // product. 5_000 bps is already well above any legitimate parametric
+        // or indemnity rate and leaves headroom for high-risk categories.
+        if params.premium_rate_bps > 5_000 {
             panic_with_error!(&env, Error::InvalidPremiumRate);
         }
-        // trigger_threshold must be positive and within the 7-decimal fixed-point
-        // range used across the protocol (1 unit = 0.0000001; max ≈ 1 quadrillion).
+        // trigger_threshold must be strictly positive (issue #619) and within
+        // the 7-decimal fixed-point range used across the protocol
+        // (1 unit = 0.0000001; max ≈ 1 quadrillion). Zero or negative
+        // thresholds would make every policy unconditionally payable.
         if params.trigger_threshold <= 0
             || params.trigger_threshold > 1_000_000_000_000_000_000_000i128
         {
             panic_with_error!(&env, Error::InvalidTriggerThreshold);
         }
         // Coverage bounds must form a valid, positive range: 0 < min < max.
-        // Rejects free coverage (min == 0) and inverted ranges (min >= max).
+        // Rejects free coverage (min <= 0) and inverted or zero-width ranges
+        // (min >= max), which `buy_policy` could never satisfy (issue #567).
+        // A non-positive `max` cannot satisfy the same inequality, so it
+        // needs no separate branch.
         if params.coverage_min <= 0 || params.coverage_min >= params.coverage_max {
             panic_with_error!(&env, Error::InvalidCoverageRange);
+        }
+        // Coverage ceiling must be reasonable (issue #616). An unbounded
+        // coverage_max would let a single policy lock unbounded pool capital
+        // and create unrealistic exposure. Capped at MAX_COVERAGE_LIMIT to
+        // match the per-policy limit in buy_policy_inner.
+        if params.coverage_max > MAX_COVERAGE_LIMIT {
+            panic_with_error!(&env, Error::CoverageOutOfRange);
         }
         // max_duration_days must be positive and less than 3650 (up to 10 years)
         // Rejects 0-day policies and unrealistically long durations
         if params.max_duration_days == 0 || params.max_duration_days > 3650 {
             panic_with_error!(&env, Error::InvalidDurationRange);
         }
-        // Validate oracle_key format and length (Issue #491).
-        // Must be 3..=32 chars, cannot start or end with '_', no consecutive '__',
-        // and must contain at least one alphabetic character.
+        // Oracle keys follow the documented 3..=9 alphanumeric format.
         {
             let sym_val = params.oracle_key.to_symbol_val();
             let sym_str: Result<SymbolStr, _> = SymbolStr::try_from_val(&env, &sym_val);
@@ -301,27 +374,15 @@ impl PolicyEngine {
                 Ok(s) => {
                     let s_str: &str = s.as_ref();
                     let bytes: &[u8] = s_str.as_bytes();
-                    if bytes.len() < 3 || bytes.len() > 32 {
-                        panic_with_error!(&env, Error::InvalidOracleKey);
-                    }
-                    if bytes[0] == b'_' || bytes[bytes.len() - 1] == b'_' {
+                    if bytes.len() < 3 || bytes.len() > 9 {
                         panic_with_error!(&env, Error::InvalidOracleKey);
                     }
                     let mut has_alpha = false;
-                    let mut prev_underscore = false;
                     for &b in bytes {
-                        if b == b'_' {
-                            if prev_underscore {
-                                panic_with_error!(&env, Error::InvalidOracleKey);
-                            }
-                            prev_underscore = true;
-                        } else {
-                            prev_underscore = false;
-                            if (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') {
-                                has_alpha = true;
-                            } else if !(b >= b'0' && b <= b'9') {
-                                panic_with_error!(&env, Error::InvalidOracleKey);
-                            }
+                        if (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') {
+                            has_alpha = true;
+                        } else if !(b >= b'0' && b <= b'9') {
+                            panic_with_error!(&env, Error::InvalidOracleKey);
                         }
                     }
                     if !has_alpha {
@@ -367,6 +428,7 @@ impl PolicyEngine {
             name: params.name,
             category: params.category,
             oracle_key: params.oracle_key,
+            expected_token: params.expected_token,
             trigger_type: params.trigger_type,
             oracle_data_type: params.oracle_data_type,
             trigger_threshold: params.trigger_threshold,
@@ -467,6 +529,18 @@ impl PolicyEngine {
 
     /// Admin-only: permanently retire a product. It is removed from the active list and its
     /// `(category, oracle_key)` slot is freed so another product may reuse it.
+    ///
+    /// The name index is released too (issue #570). Freeing the name matters
+    /// as much as freeing the oracle key: `create_product` rejects a name that
+    /// is still mapped, so leaving the uniqueness index behind would outlive
+    /// the product it describes and the admin could never re-launch the same
+    /// product line under the same name. It would also silently reserve a
+    /// name that no live product answers to, which is the behaviour users see
+    /// as "that name is taken" for a product that no longer exists.
+    ///
+    /// The `(category, oracle_key)` slot and the pool's product count keep
+    /// their existing decrement behaviour, so retiring a product never leaves
+    /// the pool's accounting or a live product's key untouched.
     pub fn deprecate_product(env: Env, admin: Address, product_id: u128) {
         Self::require_admin(&env, &admin);
         let mut product: InsuranceProduct = Self::load_product(&env, product_id);
@@ -507,6 +581,15 @@ impl PolicyEngine {
                 .extend_ttl(&pool_count_key, TTL_THRESHOLD, TTL_EXTEND_TO);
         }
 
+        // Release the name so a successor product can take it (issue #570).
+        // Only remove the index entry when it still points at *this* product:
+        // a stale mapping left by an earlier product must not be dropped just
+        // because a different product happened to share the name.
+        let name_key = StorageKey::ProductName(product.name.clone());
+        if env.storage().persistent().get::<_, u128>(&name_key) == Some(product_id) {
+            env.storage().persistent().remove(&name_key);
+        }
+
         let key = (product.category, product.oracle_key);
         env.storage()
             .persistent()
@@ -530,10 +613,33 @@ impl PolicyEngine {
         coverage_amount: i128,
         duration_days: u32,
         oracle_key: Symbol,
+        payment_token: Address,
     ) -> u128 {
         buyer.require_auth();
         Self::ensure_not_paused(&env);
-        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key)
+        let now = env.ledger().timestamp();
+        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key, now, &payment_token)
+    }
+
+    /// Buy an insurance policy that starts at `start_time` instead of now.
+    ///
+    /// `start_time` must be `>= ` the current ledger timestamp; a start in the
+    /// past would let a buyer purchase cover for a period that has already
+    /// happened (issue #522). The policy runs from `start_time` for
+    /// `duration_days`. Claims cannot be filed before `start_time`.
+    pub fn buy_policy_scheduled(
+        env: Env,
+        buyer: Address,
+        product_id: u128,
+        coverage_amount: i128,
+        duration_days: u32,
+        oracle_key: Symbol,
+        start_time: u64,
+        payment_token: Address,
+    ) -> u128 {
+        buyer.require_auth();
+        Self::ensure_not_paused(&env);
+        Self::buy_policy_inner(&env, &buyer, product_id, coverage_amount, duration_days, oracle_key, start_time, &payment_token)
     }
 
     /// Buy multiple policies in a single atomic transaction.
@@ -553,6 +659,7 @@ impl PolicyEngine {
             panic_with_error!(&env, Error::BatchTooLarge);
         }
 
+        let now = env.ledger().timestamp();
         let mut ids = Vec::new(&env);
         for item in items.iter() {
             ids.push_back(Self::buy_policy_inner(
@@ -562,6 +669,8 @@ impl PolicyEngine {
                 item.coverage_amount,
                 item.duration_days,
                 item.oracle_key,
+                now,
+                &item.payment_token,
             ));
         }
         ids
@@ -574,7 +683,45 @@ impl PolicyEngine {
         coverage_amount: i128,
         duration_days: u32,
         oracle_key: Symbol,
+        start_time: u64,
+        payment_token: &Address,
     ) -> u128 {
+        // Issue #522: never allow a backdated start.
+        if start_time < env.ledger().timestamp() {
+            panic_with_error!(env, Error::InvalidStartTime);
+        }
+        
+        // SECURITY FIX: Validate oracle_key length to prevent excessively long keys
+        // that could cause issues with oracle lookups. Backend validates max 32 chars,
+        // but direct contract calls could bypass that. Enforce the same limit on-chain.
+        {
+            let sym_val = oracle_key.to_symbol_val();
+            let sym_str: Result<soroban_sdk::SymbolStr, _> = soroban_sdk::SymbolStr::try_from_val(env, &sym_val);
+            match sym_str {
+                Ok(s) => {
+                    let s_str: &str = s.as_ref();
+                    let bytes: &[u8] = s_str.as_bytes();
+                    // Reject oracle keys longer than 32 characters
+                    if bytes.len() > 32 {
+                        panic_with_error!(env, Error::InvalidOracleKey);
+                    }
+                }
+                Err(_) => {
+                    panic_with_error!(env, Error::InvalidOracleKey);
+                }
+            }
+        }
+        // The admin controls product configuration and policy settlement
+        // wiring, so allowing them to be a policyholder creates a direct
+        // self-dealing path.
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        if *buyer == admin {
+            panic_with_error!(env, Error::AdminCannotBuyPolicy);
+        }
         let product = Self::load_product(env, product_id);
         if product.status != ProductStatus::Active {
             panic_with_error!(env, Error::ProductNotActive);
@@ -592,6 +739,11 @@ impl PolicyEngine {
         if duration_days == 0 {
             panic_with_error!(env, Error::InvalidDurationRange);
         }
+        // Issue #623: validate duration_days against the product ceiling
+        // explicitly.  The computed (end_time - start_time) must never
+        // exceed max_duration_days * 86_400 seconds.  Checking the
+        // parameter here (before any arithmetic) ensures this holds even
+        // for scheduled-start policies where start_time != now.
         if duration_days > product.max_duration_days {
             panic_with_error!(env, Error::DurationTooLong);
         }
@@ -609,26 +761,37 @@ impl PolicyEngine {
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
         
-        let usdc: Address = env
-            .storage()
-            .instance()
-            .get(&StorageKey::UsdcToken)
-            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        // SECURITY FIX: reject payment if token does not match the product's expected token
+        if payment_token != &product.expected_token {
+            panic_with_error!(&env, Error::InvalidToken);
+        }
 
         // SECURITY FIX: Transfer the calculated required premium amount, not any caller-provided value.
         // This ensures the premium matches the product's premium_rate.
-        token::Client::new(env, &usdc).transfer(buyer, &env.current_contract_address(), &required_premium);
+        token::Client::new(env, payment_token).transfer(buyer, &env.current_contract_address(), &required_premium);
 
         let now = env.ledger().timestamp();
-        let start_time = now;
         let duration_secs = (duration_days as u64)
             .checked_mul(86_400)
             .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
         let end_time = start_time
             .checked_add(duration_secs)
             .unwrap_or_else(|| panic_with_error!(env, Error::CoverageOutOfRange));
+        
+        // SECURITY FIX: Validate that start_time < end_time to prevent invalid policies.
+        // Policies with start >= end are meaningless and should be rejected at purchase time.
+        // This check protects against arithmetic edge cases and ensures policy duration is positive.
         if end_time <= start_time {
             panic_with_error!(env, Error::InvalidDurationRange);
+        }
+        // Issue #623: defense-in-depth -- confirm the computed span does
+        // not exceed max_duration_days * 86_400 seconds.  This catches any
+        // future code path that might compute duration_secs independently.
+        let max_duration_secs = (product.max_duration_days as u64)
+            .checked_mul(86_400)
+            .unwrap_or(u64::MAX);
+        if end_time.saturating_sub(start_time) > max_duration_secs {
+            panic_with_error!(env, Error::DurationTooLong);
         }
         let policy_id = Self::next_policy_id(env);
 
@@ -642,7 +805,7 @@ impl PolicyEngine {
             oracle_data_type: product.oracle_data_type,
             trigger_threshold: product.trigger_threshold,
             trigger_comparison: product.trigger_comparison,
-            start_time: now,
+            start_time,
             end_time,
             status: PolicyStatus::Active,
             created_at: now,
@@ -1484,3 +1647,5 @@ mod test;
 mod test_advanced;
 #[cfg(test)]
 mod test_product_names;
+#[cfg(test)]
+mod test_category_validation;

@@ -33,7 +33,7 @@ fn create_crop_product(_env: &Env, client: &PolicyEngineClient, admin: &Address)
         &CreateProductParams {
             name: symbol_short!("crop_kism"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -161,7 +161,7 @@ fn max_products_per_pool_blocks_unbounded_category_growth() {
     let mut params = CreateProductParams {
         name: symbol_short!("crop_a"),
         category: symbol_short!("crop"),
-        oracle_key: symbol_short!("kis2606"),
+        oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
         trigger_type: TriggerType::Threshold,
         oracle_data_type: symbol_short!("weather"),
         trigger_threshold: 50_000_000,
@@ -193,7 +193,7 @@ fn deprecating_product_releases_pool_product_slot() {
     let mut params = CreateProductParams {
         name: symbol_short!("crop_a"),
         category: symbol_short!("crop"),
-        oracle_key: symbol_short!("kis2606"),
+        oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
         trigger_type: TriggerType::Threshold,
         oracle_data_type: symbol_short!("weather"),
         trigger_threshold: 50_000_000,
@@ -337,6 +337,76 @@ fn test_buy_policy_start_time_is_current_ledger_time() {
     assert!(p2.start_time >= p1.start_time);
 }
 
+/// Issue #522: a scheduled policy starts at the requested future time.
+#[test]
+fn test_buy_policy_scheduled_future_start() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_748_736_000);
+    let start = 1_748_736_000 + 7 * 86_400;
+    let id = client.buy_policy_scheduled(
+        &buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"), &start,
+    );
+    let p = client.get_policy(&id);
+    assert_eq!(p.start_time, start);
+    assert_eq!(p.end_time, start + 30 * 86_400);
+    assert_eq!(p.created_at, 1_748_736_000);
+}
+
+/// Issue #522: a start equal to the current ledger time is accepted.
+#[test]
+fn test_buy_policy_scheduled_start_now_ok() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_748_736_000);
+    let id = client.buy_policy_scheduled(
+        &buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"), &1_748_736_000u64,
+    );
+    assert_eq!(client.get_policy(&id).start_time, 1_748_736_000);
+}
+
+/// Issue #522: a backdated start is rejected and no premium is taken.
+#[test]
+fn test_buy_policy_scheduled_past_start_rejected() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_748_736_000);
+    let res = client.try_buy_policy_scheduled(
+        &buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"), &1_748_735_999u64,
+    );
+    assert_eq!(res.unwrap_err().unwrap(), soroban_sdk::Error::from_contract_error(Error::InvalidStartTime as u32));
+    assert_eq!(TokenClient::new(&env, &usdc).balance(&buyer), 1_000_000_000i128);
+}
+
+/// Issue #576: the admin cannot buy a policy on a product they control.
+#[test]
+fn test_admin_cannot_buy_policy() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    StellarAssetClient::new(&env, &usdc).mint(&admin, &1_000_000_000i128);
+
+    let result = client.try_buy_policy(
+        &admin, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"),
+    );
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        soroban_sdk::Error::from_contract_error(Error::AdminCannotBuyPolicy as u32)
+    );
+}
+
 #[test]
 fn test_buy_policy_appears_in_user_list() {
     let (env, admin, _oracle, usdc, contract_id) = setup();
@@ -417,7 +487,7 @@ fn test_create_product_zero_duration_panics() {
         &CreateProductParams {
             name: symbol_short!("bad"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -441,7 +511,7 @@ fn test_create_product_duration_too_long_panics() {
         &CreateProductParams {
             name: symbol_short!("bad"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -466,7 +536,7 @@ fn test_create_product_valid_duration_succeeds() {
         &CreateProductParams {
             name: symbol_short!("min"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -685,7 +755,7 @@ fn test_create_product_zero_threshold_panics() {
         &CreateProductParams {
             name: symbol_short!("bad"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 0i128, // ← invalid: zero
@@ -709,7 +779,7 @@ fn test_create_product_negative_threshold_panics() {
         &CreateProductParams {
             name: symbol_short!("bad"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: -1i128, // ← invalid: negative
@@ -733,7 +803,7 @@ fn test_create_product_overflow_threshold_panics() {
         &CreateProductParams {
             name: symbol_short!("bad"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: i128::MAX, // ← invalid: overflows protocol range
@@ -761,7 +831,7 @@ fn test_duplicate_category_oracle_key_panics() {
         &CreateProductParams {
             name: symbol_short!("crop_k_a"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -779,7 +849,7 @@ fn test_duplicate_category_oracle_key_panics() {
         &CreateProductParams {
             name: symbol_short!("crop_k_b"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"), // ← duplicate key
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(), // ← duplicate key
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 60_000_000,
@@ -804,7 +874,7 @@ fn test_different_oracle_keys_same_category_succeeds() {
         &CreateProductParams {
             name: symbol_short!("crop_kis"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -849,7 +919,7 @@ fn test_deprecated_product_key_can_be_reused() {
         &CreateProductParams {
             name: symbol_short!("crop_k_v1"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -870,7 +940,7 @@ fn test_deprecated_product_key_can_be_reused() {
         &CreateProductParams {
             name: symbol_short!("crop_k_v2"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"), // ← reused key
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(), // ← reused key
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 60_000_000,
@@ -932,7 +1002,7 @@ fn test_premium_matches_formula() {
 /// a positive rate to produce a non-zero transfer, and `create_product`
 /// validates this at creation time.
 #[test]
-#[should_panic(expected = "Error(Contract, #13)")]
+#[should_panic(expected = "Error(Contract, #38)")]
 fn test_create_product_zero_premium_rate_panics() {
     let (env, admin, _oracle, _usdc, contract_id) = setup();
     let client = PolicyEngineClient::new(&env, &contract_id);
@@ -941,7 +1011,7 @@ fn test_create_product_zero_premium_rate_panics() {
         &CreateProductParams {
             name: symbol_short!("free_pol"),
             category: symbol_short!("crop"),
-            oracle_key: symbol_short!("kis2606"),
+            oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
             trigger_type: TriggerType::Threshold,
             oracle_data_type: symbol_short!("weather"),
             trigger_threshold: 50_000_000,
@@ -1766,4 +1836,153 @@ fn test_non_admin_cannot_resume() {
     
     let stranger = Address::generate(&env);
     client.emergency_resume(&stranger);
+}
+
+// ── Coverage range must be a real range (issue #567) ───────────────────────────
+
+/// A product is only meaningful if a policyholder can actually buy
+/// something: `buy_policy` rejects any coverage below `coverage_min` or
+/// above `coverage_max` (line ~631). A product published with
+/// `coverage_min > coverage_max` therefore has an empty buyable set — the
+/// product exists, is listed as active, and can never be sold, which is
+/// indistinguishable from a broken product to an integrator.
+///
+/// `coverage_min == coverage_max` is the same defect by another route: a
+/// single reachable coverage amount, and only if the arithmetic lands
+/// exactly. `coverage_min <= 0` is worse still — free cover.
+fn params_with_coverage(min: i128, max: i128) -> CreateProductParams {
+    CreateProductParams {
+        name: symbol_short!("cov_rng"),
+        category: symbol_short!("crop"),
+        oracle_key: symbol_short!("kis2606"), payment_token: w.usdc.address.clone(), expected_token: w.usdc.address.clone(),
+        trigger_type: TriggerType::Threshold,
+        oracle_data_type: symbol_short!("weather"),
+        trigger_threshold: 50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min: min,
+        coverage_max: max,
+        premium_rate_bps: 500,
+        max_duration_days: 365,
+    }
+}
+
+/// The reported case: min strictly above max.
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn create_product_rejects_inverted_coverage_range() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    PolicyEngineClient::new(&env, &contract_id)
+        .create_product(&admin, &params_with_coverage(10_000_000_000, 100_000_000));
+}
+
+/// One unit of separation is still a range; only equality is rejected.
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn create_product_rejects_zero_width_coverage_range() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    PolicyEngineClient::new(&env, &contract_id)
+        .create_product(&admin, &params_with_coverage(1_000_000_000, 1_000_000_000));
+}
+
+/// Free cover, and inverted-by-sign nonsense, are the same invariant.
+#[test]
+fn create_product_rejects_zero_or_negative_coverage_min() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    assert!(client
+        .try_create_product(&admin, &params_with_coverage(0, 10_000_000_000))
+        .is_err());
+    assert!(client
+        .try_create_product(&admin, &params_with_coverage(-1, 10_000_000_000))
+        .is_err());
+}
+
+/// A non-positive `coverage_max` cannot satisfy `0 < min < max` either, so
+/// it is rejected by the same check without needing its own branch.
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn create_product_rejects_non_positive_coverage_max() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    PolicyEngineClient::new(&env, &contract_id)
+        .create_product(&admin, &params_with_coverage(100_000_000, 0));
+}
+
+/// The boundary must not be over-tight: adjacent bounds, and the smallest
+/// legal range, are both real products and must be accepted.
+#[test]
+fn create_product_accepts_narrow_but_valid_coverage_ranges() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+
+    let id = client.create_product(&admin, &params_with_coverage(1, 2));
+    let product = client.get_product(&id);
+    assert_eq!(product.coverage_min, 1);
+    assert_eq!(product.coverage_max, 2);
+
+    let mut wide = params_with_coverage(999_999, 1_000_000);
+    wide.name = symbol_short!("cov_rng2");
+    wide.oracle_key = symbol_short!("kis2607");
+    let id = client.create_product(&admin, &wide);
+    assert_eq!(client.get_product(&id).coverage_min, 999_999);
+}
+
+/// A rejected product must leave nothing behind — no active product, and
+/// no product id consumed — so a later valid create still gets id 1.
+#[test]
+fn rejected_coverage_range_writes_nothing() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+
+    assert!(client
+        .try_create_product(&admin, &params_with_coverage(10_000_000_000, 1_000_000_000))
+        .is_err());
+    assert_eq!(client.get_active_products().len(), 0);
+    assert_eq!(client.create_product(&admin, &params_with_coverage(1_000, 2_000)), 1);
+}
+
+#[test]
+fn test_buy_policy_correct_token() {
+    let w = deploy();
+    let product_id = w.pe.create_product(&w.admin, &CreateProductParams {
+        name: symbol_short!("test"),
+        category: symbol_short!("crop"),
+        oracle_key: symbol_short!("kis2606"),
+        expected_token: w.usdc.address.clone(),
+        trigger_type: TriggerType::Threshold,
+        oracle_data_type: symbol_short!("weather"),
+        trigger_threshold: 50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min: 100_000_000,
+        coverage_max: 500_000_000,
+        premium_rate_bps: 500,
+        max_duration_days: 90,
+    });
+    
+    // Succeeds
+    let policy_id = w.pe.buy_policy(&w.buyer, &product_id, &100_000_000, &30, &symbol_short!("kis2606"), &w.usdc.address);
+    assert_eq!(policy_id, 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_buy_policy_incorrect_token() {
+    let w = deploy();
+    let product_id = w.pe.create_product(&w.admin, &CreateProductParams {
+        name: symbol_short!("test"),
+        category: symbol_short!("crop"),
+        oracle_key: symbol_short!("kis2606"),
+        expected_token: w.usdc.address.clone(),
+        trigger_type: TriggerType::Threshold,
+        oracle_data_type: symbol_short!("weather"),
+        trigger_threshold: 50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min: 100_000_000,
+        coverage_max: 500_000_000,
+        premium_rate_bps: 500,
+        max_duration_days: 90,
+    });
+    
+    let wrong_token = Address::generate(&w.env);
+    
+    w.pe.buy_policy(&w.buyer, &product_id, &100_000_000, &30, &symbol_short!("kis2606"), &wrong_token);
 }

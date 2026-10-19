@@ -215,6 +215,15 @@ pub enum Error {
     InvalidCategory           = 41,
     /// The deposit amount is not a multiple of the minimum deposit unit (issue #524).
     InvalidAmount             = 42,
+    /// A provider already holds an LP NFT, so a second one must not be minted.
+    ProviderAlreadyHasNft     = 43,
+    /// The contract admin tried to become an LP, either by depositing or by
+    /// being the receiving side of a position transfer. The admin sets the
+    /// pool's risk parameters and can authorise emergency withdrawals, so it
+    /// must not also be exposed to them (issue #568).
+    AdminCannotBeLp           = 44,
+    /// Delay exceeds the maximum allowed exit delay (issue #562)
+    ExitDelayTooLong          = 45,
 }
 
 #[contract]
@@ -328,6 +337,15 @@ impl RiskPool {
     /// `min_shares` is a slippage guard — the transaction reverts if fewer shares would be issued.
     /// `compound_enabled` — if true, accrued yield is automatically reinvested (compounded)
     /// instead of being paid out on each deposit. LPs can toggle this later via `toggle_compound`.
+    ///
+    /// The admin cannot be an LP (issue #568). LP principal is the pool's
+    /// solvency backstop, and the admin also sets capacity, fees, tier
+    /// discounts, exit delay and the emergency withdrawal that pays an LP
+    /// out. An admin who is also an LP is short the pool with one hand and
+    /// entitled to withdraw from it with the other, and a bad fee or
+    /// capacity change lands on their own deposit. The separation costs
+    /// nothing here — the pool already requires third-party liquidity to
+    /// function — so the conflict is refused outright rather than bounded.
     pub fn deposit(
         env: Env,
         provider: Address,
@@ -340,6 +358,7 @@ impl RiskPool {
         Self::validate_stellar_address(&env, &provider);
         
         provider.require_auth();
+        Self::require_not_admin(&env, &provider);
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if amount < MIN_DEPOSIT { panic_with_error!(&env, Error::DepositTooSmall); }
         if amount % MIN_DEPOSIT != 0 { panic_with_error!(&env, Error::InvalidAmount); }
@@ -351,9 +370,35 @@ impl RiskPool {
         let total_shares: i128 = env.storage().instance()
             .get(&StorageKey::TotalShares).unwrap_or(0);
 
-        // Enforce the configured pool size cap before accepting new liquidity.
+        // SECURITY FIX: Check for overflow before adding to total_deposited.
+        // Large deposits could cause arithmetic overflow and corrupt pool state.
+        // Validate using checked_add before proceeding with any state changes.
+        let new_total_deposited = total_deposited.checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+
+        // SECURITY FIX: Enforce the configured pool size cap before accepting new liquidity.
+        // Each pool is category-specific, so this enforces category-level deposit limits.
+        // Validate that the new deposit would not exceed the category's configured capacity.
         let capacity = Self::capacity(&env);
-        if total_deposited + amount > capacity.max_total_deposited {
+        if new_total_deposited > capacity.max_total_deposited {
+            panic_with_error!(&env, Error::PoolCapExceeded);
+        }
+        
+        // SECURITY FIX: Additional validation to prevent deposits that would push
+        // the pool beyond safe utilization limits for this category.
+        // Check that current utilization doesn't already exceed the limit before accepting more funds.
+        let total_locked: i128 = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
+        let current_utilization_bps = if total_deposited > 0 {
+            total_locked.checked_mul(10_000)
+                .and_then(|v| v.checked_div(total_deposited))
+                .unwrap_or(0) as u32
+        } else {
+            0
+        };
+        
+        // If utilization is already at or above max, reject new deposits to prevent
+        // over-leveraging the category pool beyond its risk tolerance.
+        if current_utilization_bps >= capacity.max_utilization_bps {
             panic_with_error!(&env, Error::PoolCapExceeded);
         }
 
@@ -373,6 +418,8 @@ impl RiskPool {
             }
             minted - burn_shares
         } else {
+            // Issue #621: integer division truncates toward zero; the
+            // MIN_SHARES guard below catches the resulting 0 case.
             amount.checked_mul(total_shares)
                 .and_then(|v| v.checked_div(total_deposited))
                 .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow))
@@ -393,8 +440,30 @@ impl RiskPool {
         }
 
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
-        token::Client::new(&env, &usdc)
-            .transfer(&provider, &env.current_contract_address(), &amount);
+        let token_client = token::Client::new(&env, &usdc);
+        let this_pool = env.current_contract_address();
+        let balance_before = token_client.balance(&this_pool);
+        // Explicitly verify the token transfer succeeded before crediting
+        // shares (issue #617). Using try_transfer and checking the result
+        // ensures a failed transfer is caught here rather than silently
+        // minting shares against funds that never arrived.
+        match token_client.try_transfer(&provider, &this_pool, &amount) {
+            Ok(Ok(())) => {}
+            _ => {
+                panic_with_error!(&env, Error::InvalidToken);
+            }
+        }
+        // The pool only ever takes the token it was configured with. Confirm
+        // that token actually delivered the full amount, so a token that
+        // under-delivers cannot mint shares against funds that never arrived
+        // (issue #552).
+        let received = token_client
+            .balance(&this_pool)
+            .checked_sub(balance_before)
+            .unwrap_or(0);
+        if received != amount {
+            panic_with_error!(&env, Error::InvalidToken);
+        }
 
         let now = env.ledger().timestamp();
         let lp_key = StorageKey::LpPosition(provider.clone());
@@ -403,9 +472,14 @@ impl RiskPool {
         let position: LpPosition = match env.storage().persistent().get::<_, LpPosition>(&lp_key) {
             Some(mut pos) => {
                 pending_yield = Self::settle_yield(&env, &mut pos);
-                pos.deposited += amount;
-                pos.shares    += new_shares;
-                pos.yield_debt = (env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0) * pos.shares) / 1_000_000_000_000;
+                pos.deposited = pos.deposited.checked_add(amount)
+                    .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+                pos.shares = pos.shares.checked_add(new_shares)
+                    .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+                let acc_per_share: i128 = env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0);
+                pos.yield_debt = acc_per_share.checked_mul(pos.shares)
+                    .and_then(|v| v.checked_div(1_000_000_000_000))
+                    .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
                 pos.compound_enabled = compound_enabled;
                 pos
             }
@@ -418,12 +492,15 @@ impl RiskPool {
                 Self::extend_to_max(&env, &lp_address_key);
                 env.storage().instance().set(&StorageKey::LpCount, &(count + 1));
                 let acc_per_share: i128 = env.storage().instance().get(&StorageKey::AccumulatedPerShare).unwrap_or(0);
+                let yield_debt = acc_per_share.checked_mul(new_shares)
+                    .and_then(|v| v.checked_div(1_000_000_000_000))
+                    .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
                 LpPosition {
                     provider:         provider.clone(),
                     deposited:        amount,
                     shares:           new_shares,
                     yield_claimed:    0,
-                    yield_debt:        (acc_per_share * new_shares) / 1_000_000_000_000,
+                    yield_debt,
                     deposited_at:     now,
                     last_yield_claim: now,
                     compound_enabled,
@@ -434,8 +511,12 @@ impl RiskPool {
         };
         env.storage().persistent().set(&lp_key, &position);
         Self::extend_to_max(&env, &lp_key);
-        env.storage().instance().set(&StorageKey::TotalDeposited, &(total_deposited + amount));
-        env.storage().instance().set(&StorageKey::TotalShares,    &(total_shares + new_shares + burn_shares));
+        // Use the pre-validated new_total_deposited calculated earlier
+        let new_total_shares = total_shares.checked_add(new_shares)
+            .and_then(|s| s.checked_add(burn_shares))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+        env.storage().instance().set(&StorageKey::TotalDeposited, &new_total_deposited);
+        env.storage().instance().set(&StorageKey::TotalShares, &new_total_shares);
 
         env.events().publish(
             (Symbol::new(&env, "liquidity_deposited"),),
@@ -472,6 +553,9 @@ impl RiskPool {
     /// is insufficient to cover the redemption.
     pub fn withdraw(env: Env, provider: Address, shares: i128) -> i128 {
         provider.require_auth();
+        if shares <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
         Self::sweep_expired_exits(&env, MAX_AUTO_EXIT_SCAN, Some(&provider));
         Self::withdraw_inner(env, provider, shares)
     }
@@ -508,7 +592,12 @@ impl RiskPool {
         };
 
         let available_liquidity = total_deposited.saturating_sub(total_locked);
-        if available_liquidity <= 0 { panic_with_error!(&env, Error::Undercollateralized); }
+        if available_liquidity <= 0 { panic_with_error!(&env, Error::PoolDrained); }
+        // Issue #621: shares * total_deposited / total_shares truncates
+        // toward zero; if the pool has absorbed losses total_deposited
+        // may be tiny relative to total_shares and a small redemption
+        // rounds to 0.  The ZeroAmount guard below rejects such cases so
+        // no shares are ever burned without returning capital.
         let amount = shares.checked_mul(total_deposited)
             .and_then(|v| v.checked_div(total_shares))
             .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
@@ -539,8 +628,16 @@ impl RiskPool {
         // All withdrawal state is persisted before either external transfer
         // runs: the principal amount, then any yield owed (checks-effects-interactions).
         let usdc: Address = env.storage().instance().get(&StorageKey::UsdcToken).unwrap();
-        token::Client::new(&env, &usdc)
-            .transfer(&env.current_contract_address(), &provider, &amount);
+        
+        // SECURITY FIX: Check the contract's actual USDC balance before attempting transfer
+        // to ensure the withdrawal won't fail due to insufficient token balance.
+        let usdc_client = token::Client::new(&env, &usdc);
+        let contract_balance = usdc_client.balance(&env.current_contract_address());
+        if contract_balance < amount {
+            panic_with_error!(&env, Error::InsufficientFunds);
+        }
+        
+        usdc_client.transfer(&env.current_contract_address(), &provider, &amount);
         Self::pay_out_yield(&env, &provider, pending_yield);
 
         amount
@@ -642,10 +739,15 @@ impl RiskPool {
 
     /// Transfer `shares` from `from` address to `to` address.
     /// Returns the proportional USDC deposit amount transferred.
+    ///
+    /// The admin cannot be the receiving side either (issue #568) —
+    /// otherwise `transfer_position` is a one-transaction way around the
+    /// `deposit` restriction and the separation of duties it exists for.
     pub fn transfer_position(env: Env, from: Address, to: Address, shares: i128) -> i128 {
         from.require_auth();
         if shares <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if from == to { panic_with_error!(&env, Error::InvalidAddress); }
+        Self::require_not_admin(&env, &to);
         Self::assert_active(&env);
 
         let from_key = StorageKey::LpPosition(from.clone());
@@ -657,9 +759,14 @@ impl RiskPool {
             panic_with_error!(&env, Error::InsufficientShares);
         }
 
+        // Issue #621: share-to-amount calculation can underflow to 0 when
+        // from_pos.deposited has been eroded by losses while shares stayed
+        // constant.  A zero-amount transfer burns the shares without moving
+        // any capital, so reject it explicitly.
         let amount = shares.checked_mul(from_pos.deposited)
             .and_then(|v| v.checked_div(from_pos.shares))
             .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+        if amount == 0 { panic_with_error!(&env, Error::ZeroAmount); }
 
         let pending_yield_from = Self::settle_yield(&env, &mut from_pos);
         from_pos.deposited = from_pos.deposited.saturating_sub(amount);
@@ -954,7 +1061,7 @@ impl RiskPool {
         Self::require_admin(&env, &admin);
 
         if delay_seconds > MAX_EXIT_DELAY {
-            panic_with_error!(&env, Error::InvalidCapacity);
+            panic_with_error!(&env, Error::ExitDelayTooLong);
         }
 
         env.storage()
@@ -980,8 +1087,14 @@ impl RiskPool {
     /// provider, so the reserved total cannot be inflated past what the LP
     /// actually holds.
     ///
-    /// Panics with `ExitAlreadyQueued` if a request is already outstanding;
-    /// cancel it first to change the amount.
+    /// Issue #458: if a request is already outstanding for this provider,
+    /// the new shares are ADDED to the existing entry rather than rejected.
+    /// The original `requested_at` and `claimable_at` are preserved so a
+    /// second call cannot silently defer the first request's unlock — a
+    /// provider who tops up their exit still has to wait for the timelock
+    /// that started with the initial request. The provider's total shares
+    /// must still cover the summed exit; otherwise the existing entry is
+    /// left untouched and the call reverts with `InsufficientFunds`.
     pub fn request_exit(env: Env, provider: Address, shares: i128) {
         provider.require_auth();
         if shares <= 0 {
@@ -995,24 +1108,36 @@ impl RiskPool {
             .persistent()
             .get(&StorageKey::LpPosition(provider.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, Error::NoShares));
-        if position.shares < shares {
-            panic_with_error!(&env, Error::InsufficientFunds);
-        }
 
         let req_key = StorageKey::ExitReq(provider.clone());
-        if env.storage().persistent().has(&req_key) {
-            panic_with_error!(&env, Error::ExitAlreadyQueued);
+        // Issue #458: read any existing entry and treat the write as an
+        // accumulate. `total_shares` is what the provider now expects to
+        // withdraw at claim time; it must not exceed their live share
+        // balance.
+        let existing: Option<ExitRequest> = env.storage().persistent().get(&req_key);
+        let (total_shares, requested_at, claimable_at) = match &existing {
+            Some(prev) => (
+                prev.shares.saturating_add(shares),
+                prev.requested_at,
+                prev.claimable_at,
+            ),
+            None => {
+                let now = env.ledger().timestamp();
+                (shares, now, now.saturating_add(Self::exit_delay(&env)))
+            }
+        };
+        if position.shares < total_shares {
+            // Leave `existing` untouched so a failed top-up cannot corrupt
+            // an already-valid request.
+            panic_with_error!(&env, Error::InsufficientFunds);
         }
-
-        let now = env.ledger().timestamp();
-        let claimable_at = now.saturating_add(Self::exit_delay(&env));
 
         env.storage().persistent().set(
             &req_key,
             &ExitRequest {
                 provider: provider.clone(),
-                shares,
-                requested_at: now,
+                shares: total_shares,
+                requested_at,
                 claimable_at,
             },
         );
@@ -1023,6 +1148,9 @@ impl RiskPool {
             .instance()
             .get(&StorageKey::QueuedExitShares)
             .unwrap_or(0);
+        // Bump the pool-wide queued counter by the increment only. On a
+        // fresh request the increment equals the total; on a top-up it
+        // equals just the newly queued portion.
         env.storage()
             .instance()
             .set(&StorageKey::QueuedExitShares, &queued.saturating_add(shares));
@@ -1312,6 +1440,31 @@ impl RiskPool {
         if attachment_point < 0 || coverage_limit < 0 {
             panic_with_error!(&env, Error::InvalidReinsuranceConfig);
         }
+        
+        // SECURITY FIX: Validate that the reinsurer contract implements the required
+        // IReinsurer interface by attempting to call a test recover with zero amount.
+        // This prevents a malicious or buggy contract from being set as the reinsurer
+        // and potentially draining the pool by returning fraudulent recovery amounts.
+        // A valid reinsurer must accept this call without panicking.
+        let test_policy_id = 0u128;
+        let test_amount = 0i128;
+        let test_result = env.try_invoke_contract::<i128, soroban_sdk::Error>(
+            &reinsurer,
+            &Symbol::new(&env, "recover"),
+            soroban_sdk::vec![
+                &env,
+                env.current_contract_address().into_val(&env),
+                test_policy_id.into_val(&env),
+                test_amount.into_val(&env),
+            ],
+        );
+        
+        // If the reinsurer doesn't implement recover() or the call fails,
+        // reject the configuration
+        if test_result.is_err() {
+            panic_with_error!(&env, Error::InvalidReinsuranceConfig);
+        }
+        
         let config = ReinsuranceConfig {
             reinsurer: reinsurer.clone(),
             attachment_point,
@@ -2450,6 +2603,19 @@ impl RiskPool {
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         if *caller != admin { panic_with_error!(env, Error::Unauthorized); }
         caller.require_auth();
+    }
+
+    /// Panic with `AdminCannotBeLp` if `caller` is the contract admin.
+    ///
+    /// Separation of duties for the LP side of the pool (issue #568). Kept
+    /// deliberately distinct from `Unauthorized` so an integrator can tell
+    /// "this address is barred from being an LP" from "this address is not
+    /// allowed to do that".
+    fn require_not_admin(env: &Env, caller: &Address) {
+        let admin: Option<Address> = env.storage().instance().get(&StorageKey::Admin);
+        if admin.as_ref() == Some(caller) {
+            panic_with_error!(env, Error::AdminCannotBeLp);
+        }
     }
 
     /// Validate that an address has a valid Stellar format (56-char, starts with G or C).

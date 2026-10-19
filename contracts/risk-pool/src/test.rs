@@ -299,6 +299,13 @@ fn test_withdraw_negative_shares_panics() {
 
 #[test]
 #[should_panic(expected = "Error(Contract, #5)")]
+fn test_withdraw_zero_shares_panics() {
+    let (_, pool, _, _, _, lp1) = setup();
+    pool.withdraw(&lp1, &0i128); // zero amount must trigger Error::ZeroAmount (#5)
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
 fn test_lock_negative_coverage_panics() {
     let (_, pool, _, admin, _, _) = setup();
     pool.lock_for_policy(&admin, &1u128, &-500i128); // negative entries must trigger Error::ZeroAmount (#5)
@@ -735,3 +742,76 @@ fn test_issue_493_deposit_slippage_protection_panics() {
     pool.deposit(&lp2, &100_0000000i128, &i128::MAX, &false);
 }
 
+
+// ── The admin may not be an LP (issue #568) ───────────────────────────────────
+
+/// LP principal is the pool's solvency backstop, and the admin also sets
+/// capacity, fees, tiers, exit delay and the emergency withdrawal that pays
+/// an LP out. An admin who is also an LP is short the pool with one hand and
+/// entitled to leave with the other, and every adverse parameter change is
+/// their own money. So the role is refused rather than bounded: the pool
+/// needs third-party liquidity anyway, and there is no legitimate version of
+/// "the admin backstops the pool".
+#[test]
+#[should_panic(expected = "Error(Contract, #44)")]
+fn admin_cannot_deposit_as_lp() {
+    let (env, pool, usdc_id, admin, _treasury, _lp1) = setup();
+    token::StellarAssetClient::new(&env, &usdc_id).mint(&admin, &1000_0000000i128);
+
+    pool.deposit(&admin, &1000_0000000i128, &0i128, &false);
+}
+
+/// The refusal must cost the admin nothing: no shares, no position, no LP
+/// NFT, no change in the pool's share supply.
+#[test]
+fn rejected_admin_deposit_writes_nothing() {
+    let (env, pool, usdc_id, admin, _treasury, lp1) = setup();
+    token::StellarAssetClient::new(&env, &usdc_id).mint(&admin, &1000_0000000i128);
+    let admin_balance_before =
+        token::Client::new(&env, &usdc_id).balance(&admin);
+    let shares_before = pool.get_stats().total_shares;
+
+    assert!(pool
+        .try_deposit(&admin, &1000_0000000i128, &0i128, &false)
+        .is_err());
+
+    assert!(pool.get_position(&admin).is_none());
+    assert_eq!(
+        token::Client::new(&env, &usdc_id).balance(&admin),
+        admin_balance_before
+    );
+    assert_eq!(pool.get_stats().total_shares, shares_before);
+    assert_eq!(pool.get_lp_count(), 0);
+
+    // The pool is still open to everyone else, and an LP who deposits is
+    // unaffected by the admin's rejection.
+    let lp_shares = pool.deposit(&lp1, &1000_0000000i128, &0i128, &false);
+    assert!(lp_shares >= MIN_SHARES);
+    assert!(pool.get_position(&lp1).is_some());
+}
+
+/// `transfer_position` must not be a way around `deposit`, or the
+/// restriction is one transaction away from being decorative.
+#[test]
+#[should_panic(expected = "Error(Contract, #44)")]
+fn admin_cannot_receive_a_position_by_transfer() {
+    let (env, pool, _usdc_id, admin, _treasury, lp1) = setup();
+    let shares = pool.deposit(&lp1, &1000_0000000i128, &0i128, &false);
+
+    pool.transfer_position(&lp1, &admin, &(shares / 2));
+}
+
+/// Sending the other direction stays open: an LP may still move shares to
+/// another ordinary address, and the sender's position is untouched.
+#[test]
+fn transfer_position_between_non_admins_still_works() {
+    let (env, pool, _usdc_id, admin, _treasury, lp1) = setup();
+    let lp2 = Address::generate(&env);
+    let shares = pool.deposit(&lp1, &1000_0000000i128, &0i128, &false);
+
+    pool.transfer_position(&lp1, &lp2, &(shares / 2));
+
+    assert!(pool.get_position(&lp2).is_some());
+    assert!(pool.get_position(&lp1).is_some());
+    assert!(pool.get_position(&admin).is_none());
+}

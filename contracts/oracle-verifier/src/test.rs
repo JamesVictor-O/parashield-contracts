@@ -220,6 +220,24 @@ fn test_remove_oracle_deactivates() {
     assert_eq!(agg_after.median_value, 50_000_000i128);
 }
 
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_submit_data_empty_key_fails() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+
+    client.add_oracle(&admin, &oracle, &weather(), &80u32);
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &Symbol::new(&env, ""),
+        &50_000_000i128,
+        &90u32,
+        &1748736000u64,
+    );
+}
+
 // ── Issue #135: OracleList must not retain soft-deleted addresses ─────────────
 
 #[test]
@@ -1359,3 +1377,129 @@ fn test_non_admin_cannot_set_geo_weight() {
     client.set_oracle_geo_weight(&impostor, &oracle, &weather(), &region, &20_000u32);
 }
 
+
+// ── Issue #565: data_key length validation ────────────────────────────────────
+
+/// A key is half of a persistent storage key, so every path that writes
+/// `(data_type, key)` must bound it before the write, not after (#565).
+/// The lower bound is the reachable one: Soroban caps `Symbol` at 32 bytes
+/// on construction, so an over-long key cannot reach the contract at all,
+/// while an empty key can — and it would collapse every reading for a
+/// data_type into one shared, unreadable bucket.
+
+#[test]
+#[should_panic(expected = "Error(Contract, #31)")]
+fn test_submit_data_rejects_empty_key() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &Symbol::new(&env, ""),
+        &32_000_000i128,
+        &95u32,
+        &env.ledger().timestamp(),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #31)")]
+fn test_batch_submit_data_rejects_empty_key() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+
+    let ts = env.ledger().timestamp();
+    let submissions = soroban_sdk::vec![
+        &env,
+        (Symbol::new(&env, ""), 32_000_000i128, 95u32, ts),
+    ];
+    client.batch_submit_data(&oracle, &weather(), &submissions);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #31)")]
+fn test_submit_data_batch_rejects_empty_key() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+
+    let submissions = soroban_sdk::vec![
+        &env,
+        OracleDataSubmission {
+            key: Symbol::new(&env, ""),
+            value: 32_000_000i128,
+            confidence: 95u32,
+            timestamp: env.ledger().timestamp(),
+        },
+    ];
+    client.submit_data_batch(&oracle, &weather(), &submissions);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #31)")]
+fn test_submit_encrypted_data_rejects_empty_key() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+
+    client.submit_encrypted_data(
+        &oracle,
+        &weather(),
+        &Symbol::new(&env, ""),
+        &soroban_sdk::Bytes::from_slice(&env, b"ciphertext-blob"),
+        &soroban_sdk::BytesN::from_array(&env, &[3u8; 12]),
+        &95u32,
+        &env.ledger().timestamp(),
+    );
+}
+
+/// The bound must not reject a key a real feed would use: a 32-byte key —
+/// the widest the host can carry — is still accepted and readable back.
+#[test]
+fn test_submit_data_accepts_max_length_key() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+
+    // 32 bytes: the widest key the host can carry.
+    let long_key = Symbol::new(&env, "flight_KQ100_2026_06_15_delay_mi");
+    assert_eq!(long_key.to_symbol_val().to_xdr(&env).len(), 40);
+
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &long_key,
+        &32_000_000i128,
+        &95u32,
+        &env.ledger().timestamp(),
+    );
+    assert_eq!(client.get_data(&weather(), &long_key).value, 32_000_000i128);
+}
+
+/// A single-character key is the lower boundary and must keep working.
+#[test]
+fn test_submit_data_accepts_single_char_key() {
+    let (env, admin, contract_id) = setup();
+    let client = OracleVerifierClient::new(&env, &contract_id);
+    let oracle = Address::generate(&env);
+    client.add_oracle(&admin, &oracle, &weather(), &90u32);
+
+    let short_key = Symbol::new(&env, "k");
+    client.submit_data(
+        &oracle,
+        &weather(),
+        &short_key,
+        &1_000_000i128,
+        &95u32,
+        &env.ledger().timestamp(),
+    );
+    assert_eq!(client.get_data(&weather(), &short_key).value, 1_000_000i128);
+}
