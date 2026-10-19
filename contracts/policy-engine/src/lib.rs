@@ -322,6 +322,9 @@ impl PolicyEngine {
             }
         }
 
+        // SECURITY FIX: Validate premium_rate_bps is positive and within acceptable bounds.
+        // Zero or negative (though u32 prevents negative) premium rates are invalid.
+        // A zero rate would provide free insurance, which is not economically viable.
         if params.premium_rate_bps == 0 {
             panic_with_error!(&env, Error::ZeroPremiumRate);
         }

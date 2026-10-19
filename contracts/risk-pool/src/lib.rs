@@ -370,11 +370,17 @@ impl RiskPool {
         let total_shares: i128 = env.storage().instance()
             .get(&StorageKey::TotalShares).unwrap_or(0);
 
+        // SECURITY FIX: Check for overflow before adding to total_deposited.
+        // Large deposits could cause arithmetic overflow and corrupt pool state.
+        // Validate using checked_add before proceeding with any state changes.
+        let new_total_deposited = total_deposited.checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+
         // SECURITY FIX: Enforce the configured pool size cap before accepting new liquidity.
         // Each pool is category-specific, so this enforces category-level deposit limits.
         // Validate that the new deposit would not exceed the category's configured capacity.
         let capacity = Self::capacity(&env);
-        if total_deposited + amount > capacity.max_total_deposited {
+        if new_total_deposited > capacity.max_total_deposited {
             panic_with_error!(&env, Error::PoolCapExceeded);
         }
         
@@ -505,8 +511,7 @@ impl RiskPool {
         };
         env.storage().persistent().set(&lp_key, &position);
         Self::extend_to_max(&env, &lp_key);
-        let new_total_deposited = total_deposited.checked_add(amount)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
+        // Use the pre-validated new_total_deposited calculated earlier
         let new_total_shares = total_shares.checked_add(new_shares)
             .and_then(|s| s.checked_add(burn_shares))
             .unwrap_or_else(|| panic_with_error!(&env, Error::Overflow));
