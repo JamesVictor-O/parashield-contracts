@@ -192,6 +192,8 @@ pub enum Error {
     PayoutDelayTooLong = 30,
     /// Dispute reason cannot be empty (issue #582).
     EmptyDisputeReason = 31,
+    /// Claim coverage amount does not match the policy coverage amount (issue #589).
+    CoverageMismatch = 32,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -561,6 +563,11 @@ impl ClaimsProcessor {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         let policy = PolicyEngineClient::new(&env, &policy_engine)
             .get_policy(&claim.policy_id);
+
+        // Guard: claim coverage must match the policy to prevent incorrect payouts (#589).
+        if claim.coverage_amount != policy.coverage_amount {
+            panic_with_error!(&env, Error::CoverageMismatch);
+        }
 
         Self::evaluate_and_settle(&env, &mut claim, &policy, partial_payout_bps)
     }
