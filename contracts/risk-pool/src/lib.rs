@@ -370,9 +370,29 @@ impl RiskPool {
         let total_shares: i128 = env.storage().instance()
             .get(&StorageKey::TotalShares).unwrap_or(0);
 
-        // Enforce the configured pool size cap before accepting new liquidity.
+        // SECURITY FIX: Enforce the configured pool size cap before accepting new liquidity.
+        // Each pool is category-specific, so this enforces category-level deposit limits.
+        // Validate that the new deposit would not exceed the category's configured capacity.
         let capacity = Self::capacity(&env);
         if total_deposited + amount > capacity.max_total_deposited {
+            panic_with_error!(&env, Error::PoolCapExceeded);
+        }
+        
+        // SECURITY FIX: Additional validation to prevent deposits that would push
+        // the pool beyond safe utilization limits for this category.
+        // Check that current utilization doesn't already exceed the limit before accepting more funds.
+        let total_locked: i128 = env.storage().instance().get(&StorageKey::TotalLocked).unwrap_or(0);
+        let current_utilization_bps = if total_deposited > 0 {
+            total_locked.checked_mul(10_000)
+                .and_then(|v| v.checked_div(total_deposited))
+                .unwrap_or(0) as u32
+        } else {
+            0
+        };
+        
+        // If utilization is already at or above max, reject new deposits to prevent
+        // over-leveraging the category pool beyond its risk tolerance.
+        if current_utilization_bps >= capacity.max_utilization_bps {
             panic_with_error!(&env, Error::PoolCapExceeded);
         }
 
