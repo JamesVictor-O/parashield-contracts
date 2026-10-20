@@ -19,7 +19,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    token, Address, Env, Symbol, Vec,
+    token, Address, Env, IntoVal, Symbol, Val, Vec,
 };
 
 pub mod types;
@@ -356,7 +356,10 @@ impl RiskPool {
         // SECURITY FIX: Validate address format before processing to prevent
         // deposits from being locked at invalid addresses
         Self::validate_stellar_address(&env, &provider);
-        
+        // Zero address cannot hold or move funds; a deposit to it would lock
+        // capital permanently with no recovery path (issue #647).
+        Self::require_not_zero_address(&env, &provider);
+
         provider.require_auth();
         Self::require_not_admin(&env, &provider);
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
@@ -2627,6 +2630,19 @@ impl RiskPool {
         let mut buf = [0u8; 56];
         addr_str.copy_into_slice(&mut buf);
         if buf[0] != b'G' && buf[0] != b'C' {
+            panic_with_error!(env, Error::InvalidAddress);
+        }
+    }
+
+    /// Rejects the Stellar zero address (all-A account), which cannot hold or
+    /// move funds — a deposit made to it would lock capital with no recovery
+    /// path (issue #647).
+    fn require_not_zero_address(env: &Env, address: &Address) {
+        let zero = Address::from_string(&soroban_sdk::String::from_str(
+            env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        if *address == zero {
             panic_with_error!(env, Error::InvalidAddress);
         }
     }

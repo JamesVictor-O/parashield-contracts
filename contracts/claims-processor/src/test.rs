@@ -2058,3 +2058,22 @@ fn set_guardians_rejects_threshold_exceeding_guardian_count() {
 
     cp.set_guardians(&w.admin, &guardians, &2u32);
 }
+
+/// Issue #645: `schedule_installments` must reject a zero or negative
+/// `amount_per_installment` — claim amounts must be strictly positive.
+#[test]
+#[should_panic(expected = "Error(Contract, #33)")]
+fn schedule_installments_rejects_negative_amount() {
+    let w       = deploy();
+    let pid     = create_crop_product(&w);
+    let buyer   = Address::generate(&w.env);
+    let pol_id  = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 30_000_000); // below threshold → payout
+
+    let cp       = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    cp.process_claim(&w.keeper, &claim_id, &None); // claim is now Paid
+
+    // A negative amount_per_installment must be rejected (issue #645).
+    cp.schedule_installments(&w.keeper, &claim_id, &-1_000_000i128, &3u32, &86_400u64);
+}

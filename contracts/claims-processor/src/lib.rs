@@ -194,6 +194,8 @@ pub enum Error {
     EmptyDisputeReason = 31,
     /// Claim coverage amount does not match the policy coverage amount (issue #589).
     CoverageMismatch = 32,
+    /// Claim amount is zero or negative; claims must be strictly positive (issue #645).
+    InvalidClaimAmount = 33,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -1042,6 +1044,11 @@ impl ClaimsProcessor {
     ) {
         Self::require_keeper(&env, &caller);
         Self::require_not_paused(&env);
+
+        // Claim amounts must be strictly positive (issue #645).
+        if amount_per_installment <= 0 {
+            panic_with_error!(&env, Error::InvalidClaimAmount);
+        }
 
         // Validate installment count to prevent storage/gas exhaustion
         if num_installments == 0 || num_installments > MAX_INSTALLMENTS {

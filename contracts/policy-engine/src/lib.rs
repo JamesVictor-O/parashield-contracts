@@ -180,6 +180,10 @@ impl PolicyEngine {
         }
         let mut oracle_buf = [0u8; 56];
         oracle_str.copy_into_slice(&mut oracle_buf);
+        // Oracle must be a contract address (starts with 'C'), not a user
+        // account ('G'). Accepting an account address would silently store
+        // an address that can never respond to cross-contract calls from the
+        // claims processor (issue #646).
         if oracle_buf[0] != b'C' {
             panic_with_error!(&env, Error::InvalidAddress);
         }

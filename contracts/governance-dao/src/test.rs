@@ -250,6 +250,26 @@ fn double_vote_fails() {
     dao.vote(&voter1, &pid, &VoteChoice::Against);
 }
 
+/// Issue #640: a voter with zero token balance must be rejected with
+/// InsufficientWeight (#4) — vote weight always equals the actual balance.
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn vote_with_zero_balance_rejected() {
+    let (env, dao, _, voter1, _, target) = setup();
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Zero-balance vote test"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+    // A new address that was never minted any governance tokens.
+    let zero_voter = Address::generate(&env);
+    dao.vote(&zero_voter, &pid, &VoteChoice::For);
+}
+
 #[test]
 #[should_panic(expected = "Error(Contract, #8)")]
 fn vote_after_period_fails() {
