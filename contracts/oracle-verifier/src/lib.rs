@@ -81,6 +81,16 @@ const DEFAULT_OUTLIER_MIN_SAMPLE_SIZE: u32 = 4;
 /// can consume by flooding submissions.
 const DEFAULT_MIN_SUBMIT_INTERVAL: u64 = 30;
 
+/// Default per-data-type range limits for common oracle data types.
+/// These prevent data type-specific overflow issues in downstream calculations.
+/// Admin can override these via set_data_type_range.
+const DEFAULT_WEATHER_MAX: i128 = 10_000_000_000i128; // 10,000 mm rainfall or 1000°C in 7-decimal
+const DEFAULT_FLIGHT_MAX: i128 = 172_800_000_000i128; // 48 hours delay in seconds (7-decimal)
+const DEFAULT_ONCHAIN_MAX: i128 = 1_000_000_000_000_000_000_000i128; // 10^21 for DeFi values
+const DEFAULT_DEFI_MAX: i128 = 1_000_000_000_000_000_000_000i128; // 10^21 for DeFi values
+const DEFAULT_DISASTER_MAX: i128 = 100_000_000i128; // Binary or magnitude values (7-decimal)
+const DEFAULT_HEALTH_MAX: i128 = 1_000_000_000i128; // Health metrics (7-decimal)
+
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -175,6 +185,10 @@ enum StorageKey {
     /// Seconds an oracle may go without submitting before it is treated as
     /// offline (u64). 0 or unset = offline detection disabled.
     OracleInactivityLimit,
+    /// Per-data-type value range limits (min, max) as (i128, i128).
+    /// Validates submissions against data-type-specific bounds to prevent
+    /// overflow in calculations specific to that data type.
+    DataTypeRange(Symbol),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -830,6 +844,58 @@ impl OracleVerifier {
     /// `set_outlier_config`.
     pub fn get_outlier_config(env: Env, data_type: Symbol) -> OutlierConfig {
         Self::effective_outlier_config(&env, &data_type)
+    }
+
+    /// Admin-only: set per-data-type value range limits.
+    /// Extreme values can cause overflow in aggregation calculations.
+    /// Use this to enforce realistic bounds for specific data types.
+    ///
+    /// `min` and `max` are absolute value bounds in 7-decimal fixed point.
+    /// Values submitted outside this range will be rejected with InvalidInput.
+    ///
+    /// Clear a configured range by setting both to 0 (reverts to defaults).
+    pub fn set_data_type_range(
+        env: Env,
+        admin: Address,
+        data_type: Symbol,
+        min: i128,
+        max: i128,
+    ) {
+        Self::require_admin(&env, &admin);
+        
+        // Validate the range makes sense
+        if min < 0 || max < 0 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        if min > max {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        if max > MAX_DATA_VALUE {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        
+        let range_key = StorageKey::DataTypeRange(data_type.clone());
+        
+        // Special case: both zero means clear the override
+        if min == 0 && max == 0 {
+            env.storage().persistent().remove(&range_key);
+        } else {
+            env.storage().persistent().set(&range_key, &(min, max));
+            env.storage().persistent().extend_ttl(&range_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+        
+        env.events().publish(
+            (Symbol::new(&env, "data_type_range_updated"),),
+            (data_type, min, max),
+        );
+    }
+
+    /// Get the configured value range for a data type.
+    /// Returns (min, max) or None if using defaults.
+    pub fn get_data_type_range(env: Env, data_type: Symbol) -> Option<(i128, i128)> {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::DataTypeRange(data_type))
     }
 
     /// Report whether the data for `(data_type, key)` is fresh enough to use,
@@ -2071,9 +2137,17 @@ impl OracleVerifier {
         if confidence == 0 || confidence > 100 {
             panic_with_error!(&env, Error::InvalidConfidence);
         }
-        // Validate data_value is within a reasonable range to prevent overflow
-        // in downstream aggregation calculations (median, weighted average, etc.)
+        
+        // SECURITY FIX: Validate data_value is within data-type-specific ranges
+        // to prevent overflow in downstream aggregation calculations.
+        // First check global bounds, then apply per-data-type limits.
         if value > MAX_DATA_VALUE || value < -MAX_DATA_VALUE {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        
+        // Get data-type-specific range if configured, otherwise use defaults
+        let type_max = Self::get_data_type_max(&env, &data_type);
+        if value.abs() > type_max {
             panic_with_error!(&env, Error::InvalidInput);
         }
 
@@ -3331,6 +3405,35 @@ impl OracleVerifier {
                 threshold_bps: DEFAULT_OUTLIER_THRESHOLD_BPS,
                 min_sample_size: DEFAULT_OUTLIER_MIN_SAMPLE_SIZE,
             })
+    }
+
+    /// Get the maximum allowed absolute value for a data type.
+    /// Returns the per-type override when set, otherwise returns a default
+    /// based on the data type name, falling back to MAX_DATA_VALUE.
+    fn get_data_type_max(env: &Env, data_type: &Symbol) -> i128 {
+        // Check for explicit admin-configured range override
+        if let Some((_, max)) = env.storage()
+            .persistent()
+            .get::<_, (i128, i128)>(&StorageKey::DataTypeRange(data_type.clone())) {
+            return max;
+        }
+        
+        // Use defaults based on data type name
+        let sym_val = data_type.to_symbol_val();
+        if let Ok(sym_str) = SymbolStr::try_from_val(env, &sym_val) {
+            let s_str: &str = sym_str.as_ref();
+            match s_str {
+                "weather" => DEFAULT_WEATHER_MAX,
+                "flight" => DEFAULT_FLIGHT_MAX,
+                "onchain" => DEFAULT_ONCHAIN_MAX,
+                "defi" => DEFAULT_DEFI_MAX,
+                "disaster" => DEFAULT_DISASTER_MAX,
+                "health" => DEFAULT_HEALTH_MAX,
+                _ => MAX_DATA_VALUE,
+            }
+        } else {
+            MAX_DATA_VALUE
+        }
     }
 
     /// Drop statistical outliers from a batch of collected oracle values

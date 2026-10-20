@@ -42,6 +42,11 @@ const MAX_EXPIRY_SCAN: u32 = 50;
 /// unrealistic exposure (issue #616). Matches the per-policy cap enforced in
 /// `buy_policy_inner`.
 const MAX_COVERAGE_LIMIT: i128 = 1_000_000_000_000;
+/// Minimum time a buyer must wait between two policy purchases on the same
+/// oracle key. Without it a buyer can stack many policies on one oracle
+/// reading in quick succession, e.g. right before a trigger looks likely
+/// (issue #671).
+const PURCHASE_COOLING_OFF_SECONDS: u64 = 24 * 60 * 60;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -77,6 +82,9 @@ enum StorageKey {
     ExpiryWarned(u128),
     /// Maps product name -> product_id, so names stay unique (issue #514).
     ProductName(Symbol),
+    /// Ledger timestamp (u64) of a buyer's last purchase on an oracle key,
+    /// used to enforce `PURCHASE_COOLING_OFF_SECONDS` (issue #671).
+    LastPurchase((Address, Symbol)),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -128,6 +136,9 @@ pub enum Error {
     InvalidStartTime = 37,
     /// Premium rate cannot be zero. (issue #564)
     ZeroPremiumRate = 38,
+    /// The buyer already bought a policy on this oracle key within the
+    /// cooling-off period (issue #671).
+    CoolingOffActive = 39,
 }
 
 // SECURITY: 48-hour timelock on critical admin actions (create_product, update_product).
@@ -180,10 +191,6 @@ impl PolicyEngine {
         }
         let mut oracle_buf = [0u8; 56];
         oracle_str.copy_into_slice(&mut oracle_buf);
-        // Oracle must be a contract address (starts with 'C'), not a user
-        // account ('G'). Accepting an account address would silently store
-        // an address that can never respond to cross-contract calls from the
-        // claims processor (issue #646).
         if oracle_buf[0] != b'C' {
             panic_with_error!(&env, Error::InvalidAddress);
         }
@@ -726,6 +733,17 @@ impl PolicyEngine {
         if *buyer == admin {
             panic_with_error!(env, Error::AdminCannotBuyPolicy);
         }
+        // Issue #671: enforce a cooling-off period between purchases by the
+        // same buyer on the same oracle key. Measured from the ledger time of
+        // the previous purchase, not its scheduled start, so scheduling
+        // policies into the future does not bypass it.
+        let purchase_key = StorageKey::LastPurchase((buyer.clone(), oracle_key.clone()));
+        let purchased_at = env.ledger().timestamp();
+        if let Some(last) = env.storage().persistent().get::<_, u64>(&purchase_key) {
+            if purchased_at < last.saturating_add(PURCHASE_COOLING_OFF_SECONDS) {
+                panic_with_error!(env, Error::CoolingOffActive);
+            }
+        }
         let product = Self::load_product(env, product_id);
         if product.status != ProductStatus::Active {
             panic_with_error!(env, Error::ProductNotActive);
@@ -798,6 +816,11 @@ impl PolicyEngine {
             panic_with_error!(env, Error::DurationTooLong);
         }
         let policy_id = Self::next_policy_id(env);
+
+        env.storage().persistent().set(&purchase_key, &purchased_at);
+        env.storage()
+            .persistent()
+            .extend_ttl(&purchase_key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         let policy = Policy {
             id: policy_id,
@@ -1653,3 +1676,5 @@ mod test_advanced;
 mod test_product_names;
 #[cfg(test)]
 mod test_category_validation;
+#[cfg(test)]
+mod test_cooling_off;
