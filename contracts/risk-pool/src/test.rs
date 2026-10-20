@@ -5,7 +5,7 @@ extern crate std;
 
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, Env, Symbol,
+    token, Address, Env, String as SorobanString, Symbol,
 };
 
 use crate::{RiskPool, RiskPoolClient, StorageKey, MIN_DEPOSIT, MIN_SHARES};
@@ -156,6 +156,21 @@ fn test_deposit_not_multiple_of_minimum_unit_panics() {
     let (_, pool, _, _, _, lp1) = setup();
     // 1_000_001 is above MIN_DEPOSIT (1_000_000) but not a multiple of the unit
     pool.deposit(&lp1, &1_000_001i128, &0i128, &false);
+}
+
+/// Issue #647: `deposit` must reject the Stellar zero address as the LP
+/// provider — zero address deposits lock capital with no recovery path.
+/// The zero-address check fires before any token transfer, so no prior mint
+/// is needed; the contract rejects the call with InvalidAddress (#20).
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn deposit_rejects_zero_address_lp() {
+    let (env, pool, _, _, _, _) = setup();
+    let zero = Address::from_string(&SorobanString::from_str(
+        &env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
+    pool.deposit(&zero, &500_000_0000000i128, &0i128, &false);
 }
 
 #[test]

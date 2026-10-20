@@ -1093,6 +1093,11 @@ impl ClaimsProcessor {
         Self::require_keeper(&env, &caller);
         Self::require_not_paused(&env);
 
+        // Claim amounts must be strictly positive (issue #645).
+        if amount_per_installment <= 0 {
+            panic_with_error!(&env, Error::InvalidClaimAmount);
+        }
+
         // Validate installment count to prevent storage/gas exhaustion
         if num_installments == 0 || num_installments > MAX_INSTALLMENTS {
             panic_with_error!(&env, Error::InvalidInput);

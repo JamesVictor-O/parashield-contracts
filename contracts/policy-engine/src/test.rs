@@ -3,7 +3,7 @@ use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Env,
+    Env, String as SorobanString,
 };
 
 const COVERAGE: i128 = 1_000_000_000; // 100 USDC (7-decimal)
@@ -74,6 +74,26 @@ fn test_initialize_accepts_any_address_type() {
         PolicyEngineClient::new(&env, &contract_id).get_admin(),
         admin
     );
+}
+
+/// Issue #646: `initialize` must reject a non-contract oracle_address.
+/// Passing a 'G'-prefixed account address must fail with InvalidAddress (#25).
+#[test]
+#[should_panic(expected = "Error(Contract, #25)")]
+fn test_initialize_rejects_account_address_as_oracle() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let usdc = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    // Use the Stellar zero account address (G-prefix) as the oracle — must be rejected.
+    let account_oracle = Address::from_string(&SorobanString::from_str(
+        &env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
+    let contract_id = env.register(PolicyEngine, ());
+    PolicyEngineClient::new(&env, &contract_id).initialize(&admin, &usdc, &account_oracle);
 }
 
 #[test]
