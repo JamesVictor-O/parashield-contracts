@@ -40,6 +40,7 @@ trait IRiskPool {
 #[soroban_sdk::contractclient(name = "PolicyEngineClient")]
 trait IPolicyEngine {
     fn get_policy(env: Env, policy_id: u128) -> parashield_policy_engine::Policy;
+    fn get_product(env: Env, product_id: u128) -> parashield_policy_engine::InsuranceProduct;
     fn pay_claim(env: Env, caller: Address, policy_id: u128);
     fn expire_policy(env: Env, caller: Address, policy_id: u128);
 }
@@ -194,6 +195,10 @@ pub enum Error {
     EmptyDisputeReason = 31,
     /// Claim coverage amount does not match the policy coverage amount (issue #589).
     CoverageMismatch = 32,
+    /// Claim coverage amount is zero or negative — nothing to pay out.
+    InvalidClaimAmount = 33,
+    /// Dispute reason symbol exceeds the maximum allowed length.
+    DisputeReasonTooLong = 34,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -957,7 +962,7 @@ impl ClaimsProcessor {
             (Symbol::new(&env, "claim_disputed"),),
             ClaimDisputed {
                 claim_id,
-                claimant,
+                claimant: caller.clone(),
                 reason,
             },
         );
@@ -2232,6 +2237,15 @@ impl ClaimsProcessor {
     }
 
     /// Remove a claim id from the pending queue, if present.
+
+    /// Return the stored Policy Engine contract address, panicking with
+    /// `NotInitialized` if the contract has not been set up yet.
+    fn policy_engine(env: &Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&StorageKey::PolicyEngine)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized))
+    }
 
     /// The configured escalation threshold for a category, or the global default.
     fn escalation_threshold(env: &Env, category: Option<Symbol>) -> u64 {
