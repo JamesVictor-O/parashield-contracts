@@ -1922,3 +1922,164 @@ fn set_time_weight_requires_admin() {
     let impostor = Address::generate(&env);
     dao.set_time_weight(&impostor, &true, &RAMP, &1_000u32);
 }
+
+// ── Issue #630: duplicate proposal detection ──────────────────────────────────
+
+/// Creating a second proposal with the same target, function, and args while
+/// the first is still Active must panic with DuplicateProposal (#50).
+#[test]
+#[should_panic(expected = "Error(Contract, #50)")]
+fn test_duplicate_proposal_rejected_while_first_is_active() {
+    let (env, dao, _admin, voter1, _v2, target) = setup();
+
+    let title = Bytes::from_slice(&env, b"Set premium rate to 5%");
+    let function = Symbol::new(&env, "update");
+    let args: Vec<Val> = Vec::new(&env);
+    let impact = Bytes::from_slice(&env, b"Adjusts the premium rate");
+
+    // First proposal succeeds.
+    dao.create_proposal(&voter1, &title, &target, &function, &args, &impact);
+
+    // Second proposal with identical target/function/args must be rejected.
+    dao.create_proposal(&voter1, &title, &target, &function, &args, &impact);
+}
+
+/// A different title or impact analysis does not make a different on-chain
+/// action — the duplicate check is purely based on target + function + args.
+#[test]
+#[should_panic(expected = "Error(Contract, #50)")]
+fn test_duplicate_proposal_different_title_still_rejected() {
+    let (env, dao, _admin, voter1, _v2, target) = setup();
+
+    let function = Symbol::new(&env, "update");
+    let args: Vec<Val> = Vec::new(&env);
+    let impact = Bytes::from_slice(&env, b"Impact analysis");
+
+    dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"First title"),
+        &target,
+        &function,
+        &args,
+        &impact,
+    );
+
+    // Different title, same action — must still be rejected.
+    dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Different title same action"),
+        &target,
+        &function,
+        &args,
+        &impact,
+    );
+}
+
+/// Proposals with different functions are NOT duplicates.
+#[test]
+fn test_proposals_with_different_functions_are_not_duplicates() {
+    let (env, dao, _admin, voter1, _v2, target) = setup();
+
+    let args: Vec<Val> = Vec::new(&env);
+    let impact = Bytes::from_slice(&env, b"Impact analysis");
+
+    let id1 = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Proposal A"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &impact,
+    );
+    // Different function — allowed.
+    let id2 = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Proposal B"),
+        &target,
+        &Symbol::new(&env, "upgrade"),
+        &args,
+        &impact,
+    );
+
+    assert_ne!(id1, id2);
+}
+
+/// Proposals with different targets are NOT duplicates.
+#[test]
+fn test_proposals_with_different_targets_are_not_duplicates() {
+    let (env, dao, _admin, voter1, _v2, target) = setup();
+
+    let target2 = env.register(MockTarget, ());
+    let function = Symbol::new(&env, "update");
+    let args: Vec<Val> = Vec::new(&env);
+    let impact = Bytes::from_slice(&env, b"Impact analysis");
+
+    let id1 = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Proposal A"),
+        &target,
+        &function,
+        &args,
+        &impact,
+    );
+    // Different target — allowed.
+    let id2 = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Proposal B"),
+        &target2,
+        &function,
+        &args,
+        &impact,
+    );
+
+    assert_ne!(id1, id2);
+}
+
+/// After the original proposal is cancelled, the same action may be
+/// re-proposed — the hash entry is cleared on cancellation.
+#[test]
+fn test_same_action_allowed_after_original_is_cancelled() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+
+    let title = Bytes::from_slice(&env, b"Set premium rate");
+    let function = Symbol::new(&env, "update");
+    let args: Vec<Val> = Vec::new(&env);
+    let impact = Bytes::from_slice(&env, b"Impact analysis");
+
+    let first_id = dao.create_proposal(&voter1, &title, &target, &function, &args, &impact);
+
+    // Cancel the first proposal.
+    dao.cancel(&admin, &first_id);
+
+    // Now the same action can be re-proposed.
+    let second_id = dao.create_proposal(&voter1, &title, &target, &function, &args, &impact);
+    assert_ne!(first_id, second_id);
+}
+
+/// After the original proposal is finalized (Failed), the same action may
+/// be re-proposed — the hash entry is cleared on finalization.
+#[test]
+fn test_same_action_allowed_after_original_is_finalized() {
+    let (env, dao, _admin, voter1, voter2, target) = setup();
+
+    let title = Bytes::from_slice(&env, b"Set premium rate");
+    let function = Symbol::new(&env, "update");
+    let args: Vec<Val> = Vec::new(&env);
+    let impact = Bytes::from_slice(&env, b"Impact analysis");
+
+    let first_id = dao.create_proposal(&voter1, &title, &target, &function, &args, &impact);
+
+    // Vote against so it fails quorum.
+    dao.vote(&voter2, &first_id, &VoteChoice::Against);
+
+    // Advance past vote_end + FINALIZE_DELAY (7 days + 5 min).
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + VOTING_PERIOD + 400);
+
+    dao.finalize(&first_id);
+    assert_eq!(dao.get_proposal(&first_id).status, ProposalStatus::Failed);
+
+    // Same action can now be re-proposed.
+    let second_id = dao.create_proposal(&voter1, &title, &target, &function, &args, &impact);
+    assert_ne!(first_id, second_id);
+}
